@@ -147,6 +147,7 @@ class GuideMonitorResult:
     mode: str
     metrics: dict[str, int]
     errors: list[str]
+    warnings: list[str] | None = None
     latest_preview_issue_id: int | None = None
     recovery_kernel_ref: str | None = None
     import_completed: bool = False
@@ -445,15 +446,18 @@ def _normalize_digest_eligibility(
     digest_eligible: bool,
     digest_reason: str | None,
 ) -> tuple[bool, str | None]:
+    reason = collapse_ws(digest_reason)
+    if reason in {"tentative_or_free_date", "sold_out", "cancelled", "missing_date", "not_scheduled_public", "non_target"}:
+        return False, reason
     if not collapse_ws(date_iso):
-        return False, collapse_ws(digest_reason) or "missing_date"
+        return False, reason or "missing_date"
     mode = collapse_ws(availability_mode)
     if mode in {"on_request_private", "private"}:
-        return False, collapse_ws(digest_reason) or "not_scheduled_public"
+        return False, reason or "not_scheduled_public"
     if collapse_ws(status) == "cancelled":
-        return False, collapse_ws(digest_reason) or "cancelled"
+        return False, reason or "cancelled"
     if digest_eligible:
-        return True, collapse_ws(digest_reason) or None
+        return True, reason or None
     evidence_count = sum(
         1
         for value in (
@@ -470,8 +474,8 @@ def _normalize_digest_eligibility(
         if collapse_ws(value)
     )
     if mode in {"", "scheduled_public", "limited"} and evidence_count >= 2:
-        return True, collapse_ws(digest_reason) or "fact_policy_promoted"
-    return bool(digest_eligible), collapse_ws(digest_reason) or None
+        return True, reason or "fact_policy_promoted"
+    return bool(digest_eligible), reason or None
 
 
 def _is_tg_post_url(url: str | None) -> bool:
@@ -2634,6 +2638,19 @@ async def _import_results_file(
     return metrics, errors, summary
 
 
+def _import_partial_warning(import_summary: Mapping[str, Any]) -> str | None:
+    if not bool(import_summary.get("partial")):
+        return None
+    stats = _safe_json_object(import_summary.get("stats"))
+    parts = ["kaggle result marked as partial"]
+    llm_deferred = int(stats.get("llm_deferred") or 0)
+    llm_error = int(stats.get("llm_error") or 0)
+    if llm_deferred or llm_error:
+        parts.append(f"llm_deferred={llm_deferred}")
+        parts.append(f"llm_error={llm_error}")
+    return "; ".join(parts)
+
+
 async def refresh_guide_profile_enrichment(
     db: Database,
     *,
@@ -2714,13 +2731,21 @@ def _guide_monitor_completion_lines(
     ops_run_id: int | None,
     metrics: Mapping[str, Any],
     errors: Sequence[str],
+    warnings: Sequence[str] | None = None,
 ) -> list[str]:
     is_remote_busy = any(str(err).startswith("remote_telegram_session_busy:") for err in errors)
+    warning_items = list(warnings or [])
     lines = [
         (
             "⏳ Мониторинг экскурсий не запущен: удалённая Telegram session занята"
             if is_remote_busy
-            else ("✅ Мониторинг экскурсий завершён" if not errors else "⚠️ Мониторинг экскурсий завершён с ошибками")
+            else (
+                "✅ Мониторинг экскурсий завершён"
+                if not errors and not warning_items
+                else "⚠️ Мониторинг экскурсий завершён с предупреждениями"
+                if not errors
+                else "⚠️ Мониторинг экскурсий завершён с ошибками"
+            )
         ),
         f"ops_run_id={ops_run_id or '—'}",
         f"run_id={run_id}",
@@ -2747,6 +2772,10 @@ def _guide_monitor_completion_lines(
         lines.append("")
         lines.append("Ошибки:")
         lines.extend(f"- {collapse_ws(err)}"[:350] for err in list(errors)[:5])
+    if warning_items:
+        lines.append("")
+        lines.append("Предупреждения:")
+        lines.extend(f"- {collapse_ws(item)}"[:350] for item in warning_items[:5])
     return lines
 
 
@@ -2782,6 +2811,7 @@ async def run_guide_import_from_results(
         "duration_sec": 0,
     }
     errors: list[str] = []
+    warnings: list[str] = []
     run_details: dict[str, Any] = {
         "mode": mode,
         "run_id": run_id,
@@ -2814,8 +2844,9 @@ async def run_guide_import_from_results(
             metrics[key] = metrics.get(key, 0) + int(value or 0)
         if import_errors:
             errors.extend(import_errors)
-        if import_summary.get("partial"):
-            errors.append("kaggle result marked as partial")
+        partial_warning = _import_partial_warning(import_summary)
+        if partial_warning:
+            warnings.append(partial_warning)
     except Exception as exc:
         logger.exception("guide_monitor.import_from_results_failed path=%s run_id=%s", results_path, run_id)
         metrics["errors"] += 1
@@ -2823,8 +2854,9 @@ async def run_guide_import_from_results(
     finally:
         metrics["duration_sec"] = int(max(0, round(time.monotonic() - started_monotonic)))
 
-    status = "success" if not errors else ("partial" if metrics["sources_scanned"] > 0 else "error")
+    status = "success" if not errors and not warnings else ("partial" if metrics["sources_scanned"] > 0 else "error")
     run_details["errors"] = errors[:20]
+    run_details["warnings"] = warnings[:20]
     await finish_ops_run(db, run_id=ops_run_id, status=status, metrics=metrics, details=run_details)
 
     if send_progress and bot and chat_id:
@@ -2836,6 +2868,7 @@ async def run_guide_import_from_results(
                     ops_run_id=ops_run_id,
                     metrics=metrics,
                     errors=errors,
+                    warnings=warnings,
                 )
             ),
             disable_web_page_preview=True,
@@ -2848,6 +2881,7 @@ async def run_guide_import_from_results(
         mode=mode,
         metrics=metrics,
         errors=errors,
+        warnings=warnings,
         recovery_kernel_ref=collapse_ws((kaggle_meta or {}).get("kernel_ref")) or None,
         import_completed=bool(import_completed),
     )
@@ -2880,6 +2914,7 @@ async def run_guide_monitor(
         "duration_sec": 0,
     }
     errors: list[str] = []
+    warnings: list[str] = []
     started_monotonic = time.monotonic()
     ops_run_id: int | None = None
     recovery_kernel_ref: str | None = None
@@ -2990,8 +3025,9 @@ async def run_guide_monitor(
                             metrics[key] = metrics.get(key, 0) + int(value or 0)
                         if import_errors:
                             errors.extend(import_errors)
-                        if import_summary.get("partial"):
-                            errors.append("kaggle result marked as partial")
+                        partial_warning = _import_partial_warning(import_summary)
+                        if partial_warning:
+                            warnings.append(partial_warning)
                     except RemoteTelegramSessionBusyError:
                         raise
                     except Exception as exc:
@@ -3085,8 +3121,9 @@ async def run_guide_monitor(
     if remote_session_busy:
         status = "skipped"
     else:
-        status = "success" if not errors else ("partial" if metrics["sources_scanned"] > 0 else "error")
+        status = "success" if not errors and not warnings else ("partial" if metrics["sources_scanned"] > 0 else "error")
     run_details["errors"] = errors[:20]
+    run_details["warnings"] = warnings[:20]
     await finish_ops_run(db, run_id=ops_run_id, status=status, metrics=metrics, details=run_details)
 
     if recovery_kernel_ref and import_completed and not auto_publish_after_import:
@@ -3107,6 +3144,7 @@ async def run_guide_monitor(
         mode=mode,
         metrics=metrics,
         errors=errors,
+        warnings=warnings,
         recovery_kernel_ref=recovery_kernel_ref or None,
         import_completed=bool(import_completed),
     )
@@ -3119,6 +3157,7 @@ async def run_guide_monitor(
                     ops_run_id=ops_run_id,
                     metrics=metrics,
                     errors=errors,
+                    warnings=warnings,
                 )
             ),
             disable_web_page_preview=True,
@@ -3283,19 +3322,28 @@ async def _fetch_digest_candidates(
     *,
     family: str,
     limit: int = 24,
+    published_state: str = "unpublished",
 ) -> list[dict[str, Any]]:
     where = [
         "go.digest_eligible = 1",
         "go.date IS NOT NULL",
+        "go.date GLOB '????-??-??'",
         "go.date >= ?",
         "go.date <= ?",
     ]
     params: list[Any] = [_today_iso(), _future_cutoff_iso()]
     if family == "new_occurrences":
-        where.append("go.published_new_digest_issue_id IS NULL")
+        column = "go.published_new_digest_issue_id"
     elif family == "last_call":
+        column = "go.published_last_call_digest_issue_id"
         where.append("go.is_last_call = 1")
-        where.append("go.published_last_call_digest_issue_id IS NULL")
+    else:
+        column = None
+    if column:
+        if published_state == "published":
+            where.append(f"{column} IS NOT NULL")
+        else:
+            where.append(f"{column} IS NULL")
     cur = await conn.execute(
         f"""
         SELECT
@@ -3381,6 +3429,35 @@ async def _fetch_digest_candidates(
     return out
 
 
+def _display_rows_excluding_published_reference_clusters(
+    display_rows: Sequence[Mapping[str, Any]],
+    *,
+    coverage_by_display_id: Mapping[int, Sequence[int]],
+    published_reference_ids: set[int],
+    limit: int,
+) -> tuple[list[dict[str, Any]], list[int]]:
+    if not published_reference_ids:
+        return [dict(row) for row in list(display_rows)[: int(limit)]], []
+    out: list[dict[str, Any]] = []
+    suppressed_candidate_ids: list[int] = []
+    for row in display_rows:
+        row_id = int(row.get("id") or 0)
+        cluster_ids = [
+            int(item)
+            for item in coverage_by_display_id.get(row_id, [row_id])
+            if int(item or 0) > 0
+        ]
+        if row_id in published_reference_ids or any(item in published_reference_ids for item in cluster_ids):
+            suppressed_candidate_ids.extend(
+                item for item in cluster_ids if item not in published_reference_ids
+            )
+            continue
+        out.append(dict(row))
+        if len(out) >= int(limit):
+            break
+    return out, list(dict.fromkeys(suppressed_candidate_ids))
+
+
 async def _load_source_medians(conn: aiosqlite.Connection, source_id: int) -> tuple[int | None, int | None]:
     cur = await conn.execute(
         """
@@ -3407,7 +3484,14 @@ async def build_guide_digest_preview(
         await _enable_row_factory(conn)
         raw_limit = max(int(limit) * 3, 48)
         rows = await _fetch_digest_candidates(conn, family=family, limit=raw_limit)
+        published_reference_rows = await _fetch_digest_candidates(
+            conn,
+            family=family,
+            limit=max(raw_limit * 2, 96),
+            published_state="published",
+        )
         prepared: list[dict[str, Any]] = []
+        published_prepared: list[dict[str, Any]] = []
         for row in rows:
             median_views, median_likes = await _load_source_medians(conn, int(row["primary_source_id"] or 0))
             row["popularity_mark"] = _popularity_mark(
@@ -3424,6 +3508,7 @@ async def build_guide_digest_preview(
             if family == "last_call":
                 score += 1.5 if int(row.get("is_last_call") or 0) else 0.0
             row["_score"] = score
+            row["_published_digest_reference"] = False
             prepared.append(row)
         prepared.sort(
             key=lambda item: (
@@ -3433,8 +3518,41 @@ async def build_guide_digest_preview(
                 int(item.get("id") or 0),
             )
         )
-        dedup = await deduplicate_occurrence_rows(prepared, family=family, limit=limit)
-        display_rows = list(dedup.display_rows)
+        for row in published_reference_rows:
+            median_views, median_likes = await _load_source_medians(conn, int(row["primary_source_id"] or 0))
+            row["popularity_mark"] = _popularity_mark(
+                views=row.get("views"),
+                likes=row.get("likes"),
+                median_views=median_views,
+                median_likes=median_likes,
+            )
+            score = float(row.get("priority_weight") or 1.0)
+            if row.get("popularity_mark"):
+                score += 0.4
+            if int(row.get("aggregator_only") or 0):
+                score -= 0.5
+            if family == "last_call":
+                score += 1.5 if int(row.get("is_last_call") or 0) else 0.0
+            row["_score"] = score
+            row["_published_digest_reference"] = True
+            published_prepared.append(row)
+        published_reference_ids = {
+            int(row.get("id") or 0)
+            for row in published_prepared
+            if int(row.get("id") or 0) > 0
+        }
+        dedup_input = [*prepared, *published_prepared]
+        dedup = await deduplicate_occurrence_rows(
+            dedup_input,
+            family=family,
+            limit=max(len(dedup_input), int(limit)),
+        )
+        display_rows, published_duplicate_suppressed_ids = _display_rows_excluding_published_reference_clusters(
+            dedup.display_rows,
+            coverage_by_display_id=dedup.coverage_by_display_id,
+            published_reference_ids=published_reference_ids,
+            limit=limit,
+        )
         display_rows, editorial_suppressed_ids, _editorial_reasons = await refine_digest_rows(
             display_rows,
             family=family,
@@ -3518,7 +3636,15 @@ async def build_guide_digest_preview(
         "items": display_rows,
         "media_items": media_items,
         "covered_occurrence_ids": occurrence_ids,
-        "suppressed_occurrence_ids": list(dict.fromkeys([*dedup.suppressed_occurrence_ids, *editorial_suppressed_ids])),
+        "suppressed_occurrence_ids": list(
+            dict.fromkeys(
+                [
+                    *dedup.suppressed_occurrence_ids,
+                    *published_duplicate_suppressed_ids,
+                    *editorial_suppressed_ids,
+                ]
+            )
+        ),
         "pair_decisions": list(dedup.pair_decisions),
     }
 
@@ -4805,6 +4931,7 @@ async def render_guide_runs_summary(
                     f"posts={int(metrics.get('posts_scanned') or 0)}",
                     f"llm_ok={int(metrics.get('llm_ok') or 0)}",
                     f"llm_def={int(metrics.get('llm_deferred') or 0)}",
+                    f"llm_err={int(metrics.get('llm_error') or 0)}",
                     f"created={int(metrics.get('occurrences_created') or 0)}",
                     f"updated={int(metrics.get('occurrences_updated') or 0)}",
                     f"errors={int(metrics.get('errors') or 0)}",
@@ -4955,6 +5082,12 @@ async def render_guide_run_report(
         lines.append("Ошибки run:")
         for error_text in detail_errors:
             lines.append(f"- {_short_text(error_text, limit=180)}")
+    detail_warnings = _normalize_string_list(details.get("warnings"), limit=10)
+    if detail_warnings:
+        lines.append("")
+        lines.append("Предупреждения run:")
+        for warning_text in detail_warnings:
+            lines.append(f"- {_short_text(warning_text, limit=180)}")
     return _chunk_plain_lines(lines)
 
 

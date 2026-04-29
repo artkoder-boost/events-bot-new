@@ -20,7 +20,7 @@ def make_event(**kwargs: object) -> main.Event:
     return main.Event(**base)
 
 
-def test_format_event_daily_uses_partner_vk_link() -> None:
+def test_format_event_daily_does_not_use_partner_vk_link_without_telegraph() -> None:
     event = make_event(
         source_post_url="https://vk.com/wall-1_1",
         creator_id=123,
@@ -28,7 +28,8 @@ def test_format_event_daily_uses_partner_vk_link() -> None:
 
     rendered = main.format_event_daily(event, partner_creator_ids={123})
 
-    assert '<a href="https://vk.com/wall-1_1">' in rendered
+    assert '<a href="https://vk.com/wall-1_1">' not in rendered
+    assert "<b>🚩 Event</b>" in rendered
 
 
 def test_format_event_daily_prefers_telegraph_for_vk_queue() -> None:
@@ -63,6 +64,57 @@ def test_format_event_daily_handles_timezone_aware_added_at() -> None:
     assert isinstance(rendered, str)
 
 
+def test_format_event_daily_keeps_city_hashtag_for_adjectival_venue_name() -> None:
+    event = make_event(
+        location_name="Клуб Светлогорского военного санатория",
+        location_address="Октябрьская 28",
+        city="Светлогорск",
+    )
+
+    rendered = main.format_event_daily(event)
+
+    assert "Клуб Светлогорского военного санатория, Октябрьская 28, #Светлогорск" in rendered
+
+
+def test_format_event_daily_drops_city_only_when_city_token_is_present() -> None:
+    event = make_event(
+        location_name="Телеграф, Островского 3, Светлогорск",
+        location_address="Островского 3",
+        city="Светлогорск",
+    )
+
+    rendered = main.format_event_daily(event)
+
+    assert "Телеграф, Островского 3, Светлогорск, Островского 3, #Светлогорск" not in rendered
+    assert "Телеграф, Островского 3, Светлогорск" in rendered
+
+
+def test_split_daily_text_atomic_keeps_event_card_together() -> None:
+    first = "\n".join(
+        [
+            "<b>👉 First</b>",
+            "Описание первого события",
+            "<i>26 апреля 12:00 Hall</i>",
+        ]
+    )
+    second = "\n".join(
+        [
+            "<b>👉 Second</b>",
+            "Описание второго события",
+            "<i>26 апреля 13:00 Hall</i>",
+        ]
+    )
+    text = "HEAD\n\n" + first + "\n\n" + second
+
+    parts = main.split_daily_text_atomic(text, limit=len("HEAD\n\n" + first) + 1)
+
+    assert len(parts) == 2
+    assert "First" in parts[0]
+    assert "26 апреля 12:00" in parts[0]
+    assert "Second" in parts[1]
+    assert "26 апреля 13:00" in parts[1]
+
+
 @pytest.mark.asyncio
 async def test_build_daily_posts_lists_recent_festivals(tmp_path):
     db = Database(str(tmp_path / "db.sqlite"))
@@ -95,7 +147,7 @@ async def test_build_daily_posts_lists_recent_festivals(tmp_path):
     text = posts[0][0]
 
     assert "ФЕСТИВАЛИ" in text
-    assert "Fest-https://telegra.ph/Fest" in text
+    assert '<a href="https://telegra.ph/Fest">✨ Fest</a>' in text
 
 
 @pytest.mark.asyncio

@@ -8,7 +8,7 @@
 
 Текущая каноническая граница совпадает с backlog-доками:
 
-- `Kaggle notebook` делает Telegram fetch, grouped albums, deterministic prefilter и `Tier 1` extraction;
+- `Kaggle notebook` делает Telegram fetch, grouped albums, OCR/vision pass по candidate images, deterministic prefilter и `Tier 1` extraction;
 - multi-announce posts inside Kaggle сначала режутся на `occurrence_blocks`, после чего Gemma extraction обязана вернуть несколько отдельных occurrences по разным датам/маршрутам, а uncovered schedule blocks добираются block-level rescue pass'ом;
 - `trail_scout.screen.v1` оценивает пост целиком и не получает `occurrence_blocks` как вход; block split используется только на extraction stage, чтобы screen не подхватывал детерминированное мнение сплиттера;
 - guide extraction идёт Opus/lollipop-style семействами, а не одним тяжёлым универсальным prompt'ом: `trail_scout.announce_extract_tier1.v1` вытаскивает только occurrence skeleton, `trail_scout.status_claim_extract.v1` обрабатывает update-посты, `trail_scout.template_extract.v1` собирает template-only сигналы, а `route_weaver.enrich.v1` отдельным коротким запросом дозаполняет семантические поля по уже найденному occurrence;
@@ -38,14 +38,24 @@
 - first-pass `base_region_fit` теперь относится к screen/extraction LLM layer, а не к смысловым regex в local fallback.
 - `base_region_fit` считается полностью Gemma-owned semantic decision: Kaggle runtime больше не держит deterministic keyword fallback по городам; если LLM не заполнил поле, результат остаётся `unknown` и post не отбрасывается по regex, а обрабатывается server-side enrichment стадиями с LLM-first ownership.
 - `Gemma 4` structured stages в guide path должны использовать native `response_schema` / `response_mime_type`, а не только prompt-level "верни JSON" contract.
+- guide Kaggle runtime теперь использует тот же `GoogleAIClient` не только для text-only stages, но и для multimodal OCR/vision calls:
+  - poster/image OCR идёт через `guide_scout_ocr` consumer на том же guide key/runtime;
+  - `ocr_chunks` подмешиваются в `trail_scout.screen.v1`, `trail_scout.*extract*` и `route_weaver.enrich.v1`, чтобы operational facts могли приходить не только из caption/body, но и из карточек/афиш;
+  - OCR остаётся fail-open: если image pass не удался, post всё равно может пройти по text-only path, а ошибка должна оставаться видимой в result payload; runtime imports required for media hashing are part of the OCR contract, so missing imports must be treated as production regressions, not harmless OCR noise;
+  - OCR logs must be operator-debuggable at post/media level: success, empty, retry and error lines include `source`, source `message_id`, media message id, image index, short media hash and OCR signal summary, so a Kaggle run can be audited without opening the JSON result file first;
 - runtime обязан фильтровать `parts[].thought = true` до JSON parsing и materialization, чтобы guide fact-pack и admin surfaces не протаскивали hidden reasoning text.
 - guide migration остаётся строго `LLM-first`: semantic screen/extract decisions не должны переезжать в regex/keyword shortcuts даже если конкретный `Gemma 4` stage ведёт себя хуже baseline; в таких случаях исправляется prompt/stage contract, а не вводится deterministic bypass по смыслу текста.
+- после `INC-2026-04-23-guide-digest-extraction-loss` prompt-contract для `Gemma 4` дополнительно закрепляет multi-date расписания как отдельные occurrence на каждую датированную строку: доступная будущая строка с общим контактом/записью и без явного `sold out/full/cancelled` должна оставаться `status=available`, `availability_mode=scheduled_public`, `digest_eligible=true`; sold-out строки остаются `digest_eligible=false`; no-date/on-demand офферы не становятся digest-ready без конкретной даты; волонтёрские субботники/cleanup/work-day события не считаются экскурсиями, пока guided walk/tour/route не является основным публичным предложением.
+- schedule-anchor detection may normalize Telegram keycap emoji digits (`3️⃣ мая`, `1️⃣3️⃣ мая`) into plain numerals only to keep `occurrence_blocks` from losing multi-date schedule lines; this is a syntax aid for block splitting and Gemma prompt context, not a deterministic semantic extractor. Multi-announce extraction gives Gemma a normalized `schedule_blocks` index, runs one bounded full-post extraction first, then uses block rescue for uncovered lines; if schedule blocks are already available, that broad full-post call has its own shorter timeout budget (`GUIDE_MONITORING_ANNOUNCE_MULTI_FULL_TIMEOUT_SEC`, default `45s`) and no same-prompt timeout retry, so long schedules split quickly into smaller LLM calls. Block extraction and enrichment must fail open per occurrence: one Gemma timeout/provider failure may drop or under-enrich that block with an explicit warning, but must not erase already extracted schedule lines from the same post. Explicitly tentative/preliminary/free-date schedule lines stay out of digest readiness until the source confirms them.
+- if Gemma returns internally inconsistent eligibility fields, disqualifying `digest_eligibility_reason` values (`tentative_or_free_date`, `sold_out`, `cancelled`, `missing_date`, `not_scheduled_public`, `non_target`) win over `digest_eligible=true`; this is a schema-consistency guardrail around LLM output, not a semantic extractor.
+- `title_normalized` в extraction prompt считается stable route identity core: без имён гидов, source labels, дат, времени, маркетинговых суффиксов и availability-слов, чтобы один source post не создавал дубли одной и той же экскурсии под разными идентичностями.
+- regression evidence для guide digest completeness должен включать не только run-level `Новых выходов`, а occurrence-level проверку: какие raw outputs были digest-ready, какие были исключены как sold-out/no-date/non-target/duplicate, и какие still-future missed cards были компенсирующе опубликованы.
 
 ## Что уже мигрировано
 
 - отдельный guide-track в основной SQLite;
 - seed-пак Telegram-источников из casebook;
-- seed-пак guide-источников теперь также включает `@art_from_the_Baltic` как provisional `guide_project` source и `@jeeptours39` как branded off-road / jeep-tour source;
+- seed-пак guide-источников теперь также включает `@art_from_the_Baltic` как provisional `guide_project` source, `@jeeptours39` как branded off-road / jeep-tour source и `@murnikovaT` как personal guide source for Kaliningrad excursions;
 - guide-specific Kaggle runtime: [kaggle/GuideExcursionsMonitor/guide_excursions_monitor.py](/workspaces/events-bot-new/kaggle/GuideExcursionsMonitor/guide_excursions_monitor.py);
 - secure Kaggle push/poll/download через тот же split-secrets pattern, что и в Telegram Monitoring;
 - guide Kaggle transport теперь повторяет продовый Telegram Monitoring pattern: kernel push содержит нужный `google_ai/` код сразу, а secrets по-прежнему идут только через два отдельных datasets (`cipher + key`), без третьего payload dataset;
@@ -74,7 +84,7 @@
 
 ## Что ещё остаётся MVP-ограничением
 
-- OCR в guide Kaggle runtime пока не доведён до backlog-parity;
+- OCR теперь закрывает основной MVP gap: candidate posts с image media проходят Gemma vision/OCR pass, а extracted `ocr_chunks` участвуют в screen/extract/enrich. До backlog-parity всё ещё остаются follow-up зоны вроде richer media fingerprinting, cross-image assignment и более глубокого OCR-debug/operator UX;
 - `status_bind / reschedule / same-occurrence` merge уже fact-first, но ещё не полный `Route Weaver v1`;
 - profile enrichment теперь отдельно materialize-ится Gemma-pass'ом из `guide_source.about_text` + sample occurrence titles/hooks, чтобы `guide_profile` копил публичное имя, регалии и области экспертизы;
 - template rollup по-прежнему строится в основном из occurrence-linked hints/facts; отдельного template-only harvesting pipeline пока нет;
@@ -204,6 +214,8 @@ Manual/live scan через `/guide_excursions` теперь должен явн
 - preview header содержит подсказки `facts=/guide_facts <id>` и `log=/guide_log <id>`, чтобы можно было вручную проверить извлечённые факты до публикации.
 - Kaggle notebook log должен явно показывать `Guide monitor llm_gateway=google_ai ... key_env=GOOGLE_API_KEY2 account_env=GOOGLE_API_LOCALNAME2`, `[gemma:client] consumer=...` и итоговую строку `Guide monitor stats posts_total=... prefilter_true=... llm_ok=... llm_deferred=...`, чтобы оператор видел, что guide-path идёт через общий limiter, а не через прямой SDK вызов.
 - guide Kaggle runtime должен переживать transient `Cannot send requests while disconnected` и явные Gemma `retry after ... ms`: на source-scan path клиент обязан переподключаться перед следующим источником, а Gemma calls должны один-два раза пережидать provider hint вместо мгновенного source-level partial;
+- guide Kaggle Gemma wrapper дополнительно делает bounded retry для `asyncio.TimeoutError` (`GUIDE_MONITORING_LLM_TIMEOUT_RETRIES`, default `1`) и provider `5xx` (`GUIDE_MONITORING_LLM_PROVIDER_5XX_RETRIES`, default `1`); schema/config errors вроде unsupported `response_schema` не ретраятся и остаются blocking diagnostics.
+- local guide Gemma 4 stages used while building digest previews (`GUIDE_OCCURRENCE_ENRICH_MODEL`, `GUIDE_EXCURSIONS_DEDUP_MODEL`, `GUIDE_DIGEST_WRITER_MODEL`) must be bounded by per-call timeouts (`GUIDE_OCCURRENCE_ENRICH_LLM_TIMEOUT_SEC`, `GUIDE_EXCURSIONS_DEDUP_LLM_TIMEOUT_SEC`, `GUIDE_DIGEST_WRITER_LLM_TIMEOUT_SEC`). On timeout they fall back to existing deterministic rows/heuristics instead of hanging the scheduled digest.
 - Канонический live pass 15 марта 2026 года подтвердил success-path `transport=kaggle -> status=success` без hidden local fallback, с `llm_deferred=0`, materialized occurrences, рабочими `/guide_facts` и `/guide_log`, и публикацией digest/media в `@keniggpt`.
 - Mass rerun 16 марта 2026 года на чистой guide DB (`run_id=8a01ff760d1e`, канонический kernel `zigomaro/guide-excursions-monitor`) подтвердил, что path работает не только на одном ручном кейсе: `sources=10`, `posts=36`, `prefilter=21`, `llm_ok=21`, `created=10`, `past_skipped=3`, `errors=0`; в итоговый published digest после runtime dedup попали `7` карточек из нескольких источников, включая multi-occurrence post `@amber_fringilla/5806` и excursion `@excursions_profitour/863`, которую раньше ложно терял overly-strict eligibility gate.
 
@@ -275,6 +287,10 @@ Guide digest не должен произвольно смешивать `про
 - `new_occurrences` публикует только те future occurrences, у которых `published_new_digest_issue_id IS NULL`;
 - после публикации карточка считается уже покрытой в family `new_occurrences` и на следующий день туда повторно не попадёт;
   При этом published-mark можно ставить только тем occurrences, которые реально вошли в опубликованный digest, плюс их dedup-cluster siblings, схлопнутым в ту же canonical card;
+- перед финальным выбором `new_occurrences` свежие candidates сравниваются тем же LLM-first dedup слоем с уже опубликованными future occurrences из окна digest. Если новый пост/агрегаторный репост оказывается той же экскурсией, что уже была в выпуске, такая строка не занимает место в новом digest и не вытесняет действительно новую карточку;
+- dedup-проход имеет общий time budget `GUIDE_EXCURSIONS_DEDUP_TOTAL_TIMEOUT_SEC`: LLM-first сравнение остаётся включённым, но серия pair-judge запросов не должна блокировать весь digest/catch-up;
+- digest-writer polish имеет общий time budget `GUIDE_DIGEST_WRITER_TOTAL_TIMEOUT_SEC`: если финальная Gemma-редактура не успевает, публикация fail-open идёт по уже собранным grounded facts и editorial fallback, а не ждёт polish бесконечно;
+- candidate date должен быть ISO-днём `YYYY-MM-DD`; текстовые recurring-значения вроде `every Thursday` не участвуют в daily digest candidate query, пока не материализованы в конкретную дату;
 - occurrences, которые были выкинуты editorial fallback'ом и не дошли до финального digest text/caption, не считаются опубликованными и должны оставаться кандидатами для следующего `full` run;
 - `last_call` — отдельная family: туда попадают только occurrences с `is_last_call=1`, у которых ещё нет `published_last_call_digest_issue_id`;
 - простое служебное обновление `updated_at` или повторный импорт тех же фактов не должны приводить к повторной публикации в `new_occurrences`;
@@ -295,7 +311,8 @@ Guide digest не должен произвольно смешивать `про
 - `GUIDE_EXCURSIONS_LIGHT_TIMES_LOCAL=09:05,13:20`
 - `GUIDE_EXCURSIONS_FULL_TIME_LOCAL=20:10`
 - `GUIDE_EXCURSIONS_TZ=Europe/Kaliningrad`
-- `ENABLE_GUIDE_DIGEST_SCHEDULED=1` включает автопубликацию `new_occurrences` сразу после успешного scheduled `full` scan/import; отдельный cron для digest здесь намеренно не используется, чтобы не гадать длительность Kaggle run и не занимать ещё одно heavy-job окно.
+- `ENABLE_GUIDE_DIGEST_SCHEDULED=1` включает автопубликацию `new_occurrences` сразу после scheduled `full` scan/import; отдельный cron для digest здесь намеренно не используется, чтобы не гадать длительность Kaggle run и не занимать ещё одно heavy-job окно.
+- post-level Kaggle `partial` из-за отдельных `llm_deferred_timeout` / provider `5xx` считается non-blocking warning для scheduled digest: свежие eligible occurrences должны публиковаться, а предупреждения остаются в operator surfaces (`/guide_report`, completion message, `/guide_runs`). Blocking failures (`Kaggle path failed`, import errors, missing results, remote session busy) по-прежнему останавливают auto-publish.
 - если после scheduled `full` scan у `new_occurrences` нет candidates, scheduled publish должен завершаться bot-only служебным сообщением оператору (`новых экскурсионных находок нет`) без публикации пустого поста в каналы;
 - scheduled `full` slot считается critical daily slot: если первичный APScheduler fire пропущен или записался как `ops_run(... status='skipped', skip_reason='heavy_busy')`, startup catch-up и live watchdog обязаны догонять тот же scheduled `full` path в пределах lookback окна, а catch-up-dispatch ждёт освобождения heavy gate вместо тихого пропуска дня;
 - same-day `light` runs не считаются подтверждением доставки daily `full` slot: recovery должен искать materialized `guide_monitoring` именно с `details.mode='full'`, иначе вечерняя автопубликация может быть ложно признана “уже выполненной”.

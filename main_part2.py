@@ -2992,6 +2992,77 @@ async def send_festival_poll(
 
 
 
+DAILY_MARKER = "\u200b"
+
+
+def split_daily_text_atomic(text: str, limit: int = 4096) -> list[str]:
+    """Split daily text without breaking event cards separated by blank lines."""
+    if len(text) <= limit:
+        return [text] if text else []
+    blocks = re.split(r"\n{2,}", text)
+    parts: list[str] = []
+    current = ""
+    for block in blocks:
+        if not block:
+            continue
+        candidate = f"{current}\n\n{block}" if current else block
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            parts.append(current)
+            current = ""
+        if len(block) > limit:
+            parts.extend(split_text(block, limit=limit))
+        else:
+            current = block
+    if current:
+        parts.append(current)
+    return parts
+
+
+def _vk_daily_post_max_chars() -> int:
+    raw = os.getenv("VK_DAILY_POST_MAX_CHARS", "12000")
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        value = 12000
+    return max(1000, min(value, 16000))
+
+
+def split_vk_daily_text_atomic(text: str, limit: int | None = None) -> list[str]:
+    """Split VK daily posts without breaking event cards when possible."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    max_len = limit or _vk_daily_post_max_chars()
+    if len(text) <= max_len:
+        return [text]
+
+    separator = f"\n{VK_EVENT_SEPARATOR}\n"
+    blocks = text.split(separator)
+    parts: list[str] = []
+    current = ""
+    for block in blocks:
+        block = block.strip("\n")
+        if not block:
+            continue
+        candidate = f"{current}{separator}{block}" if current else block
+        if len(candidate) <= max_len:
+            current = candidate
+            continue
+        if current:
+            parts.append(current)
+            current = ""
+        if len(block) > max_len:
+            parts.extend(split_text(block, limit=max_len))
+        else:
+            current = block
+    if current:
+        parts.append(current)
+    return parts
+
+
 async def build_daily_posts(
     db: Database,
     tz: timezone,
@@ -3292,12 +3363,9 @@ async def build_daily_posts(
         markup = types.InlineKeyboardMarkup(inline_keyboard=[[b] for b in buttons])
 
     combined = section1 + "\n\n\n" + section2
-    combined += "\u200b" # DAILY_MARKER
+    combined += DAILY_MARKER
     if len(combined) <= 4096:
         return [(combined, markup)]
-
-    # Marker to identify daily posts (for channel_nav filtering)
-    DAILY_MARKER = "\u200b"
 
     posts: list[tuple[str, types.InlineKeyboardMarkup | None]] = []
     
@@ -3305,12 +3373,17 @@ async def build_daily_posts(
     def _mark(t: str) -> str:
         return t + DAILY_MARKER
 
-    for part in split_text(section1):
+    text_limit = 4096 - len(DAILY_MARKER)
+    for part in split_daily_text_atomic(section1, limit=text_limit):
         posts.append((_mark(part), None))
-    section2_parts = split_text(section2)
+    section2_parts = split_daily_text_atomic(section2, limit=text_limit)
     for part in section2_parts[:-1]:
         posts.append((_mark(part), None))
-    posts.append((_mark(section2_parts[-1]), markup))
+    if section2_parts:
+        posts.append((_mark(section2_parts[-1]), markup))
+    elif posts:
+        last_text, _last_markup = posts[-1]
+        posts[-1] = (last_text, markup)
     return posts
 
 
@@ -4153,17 +4226,35 @@ async def send_daily_announcement_vk(
     # сборка постов/текста — вне семафоров
     async with span("db"):
         section1, section2 = await build_daily_sections_vk(db, tz, now)
+    max_chars = _vk_daily_post_max_chars()
+
+    async def _post_section(text: str, label: str) -> None:
+        chunks = split_vk_daily_text_atomic(text, limit=max_chars)
+        logging.info(
+            "vk daily %s split chunks=%d total_len=%d max_chars=%d",
+            label,
+            len(chunks),
+            len(text or ""),
+            max_chars,
+        )
+        for idx, chunk in enumerate(chunks, start=1):
+            url = await post_to_vk(group_id, chunk, db, bot)
+            if not url:
+                raise RuntimeError(
+                    f"vk daily {label} post failed chunk={idx}/{len(chunks)}"
+                )
+
     if section == "today":
         async with span("vk-send"):
-            await post_to_vk(group_id, section1, db, bot)
+            await _post_section(section1, "today")
     elif section == "added":
         async with span("vk-send"):
-            await post_to_vk(group_id, section2, db, bot)
+            await _post_section(section2, "added")
     else:
         async with span("vk-send"):
-            await post_to_vk(group_id, section1, db, bot)
+            await _post_section(section1, "today")
         async with span("vk-send"):
-            await post_to_vk(group_id, section2, db, bot)
+            await _post_section(section2, "added")
 
 
 async def _daily_try_claim(channel_id: int, day_key: str) -> bool:
@@ -4950,7 +5041,7 @@ async def init_db_and_scheduler(
         try:
             await bot.set_webhook(
                 hook,
-                allowed_updates=["message", "callback_query", "my_chat_member", "channel_post", "edited_channel_post"],
+                allowed_updates=list(WEBHOOK_ALLOWED_UPDATES),
             )
         except Exception as e:
             logging.error("Failed to set webhook: %s", e)
@@ -17046,6 +17137,15 @@ def create_app() -> web.Application:
     async def ocrtest_wrapper(message: types.Message):
         await handle_ocrtest(message, db, bot)
 
+    async def check_business_wrapper(message: types.Message):
+        await handle_check_business(message, db, bot)
+
+    async def check_business_cb_wrapper(callback: types.CallbackQuery):
+        await handle_check_business_callback(callback, db, bot)
+
+    async def check_business_photo_wrapper(message: types.Message):
+        await handle_check_business_photo(message, db, bot)
+
     async def ocr_detail_wrapper(callback: types.CallbackQuery):
         await vision_test.select_detail(callback, bot)
 
@@ -17561,6 +17661,24 @@ def create_app() -> web.Application:
 
     dp.message.register(help_wrapper, Command("help"))
     dp.message.register(ocrtest_wrapper, Command("ocrtest"))
+    dp.message.register(check_business_wrapper, Command("check_business"))
+    dp.message.register(
+        check_business_photo_wrapper,
+        lambda m: m.from_user is not None
+        and m.from_user.id in check_business_sessions
+        and (
+            bool(m.photo)
+            or (
+                m.document is not None
+                and (m.document.mime_type or "").startswith("image/")
+            )
+            or (m.text or "").strip().lower() == "/cancel"
+        ),
+    )
+    dp.callback_query.register(
+        check_business_cb_wrapper,
+        lambda c: bool(c.data) and c.data.startswith("cbiz:"),
+    )
     dp.message.register(start_wrapper, Command("start"))
     dp.message.register(register_wrapper, Command("register"))
     dp.message.register(requests_wrapper, Command("requests"))
@@ -17914,6 +18032,15 @@ def create_app() -> web.Application:
         or "forward_origin" in getattr(m, "model_extra", {}),
     )
     dp.my_chat_member.register(partial(handle_my_chat_member, db=db))
+    dp.business_connection.register(
+        partial(handle_business_connection, db=db, bot=bot)
+    )
+    dp.business_message.register(
+        partial(handle_business_message_connection, db=db, bot=bot)
+    )
+    dp.edited_business_message.register(
+        partial(handle_business_message_connection, db=db, bot=bot)
+    )
 
     app = web.Application()
     SimpleRequestHandler(dp, bot).register(app, path="/webhook")

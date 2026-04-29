@@ -50,7 +50,9 @@
   - the readiness poll must inspect the full paginated dataset file list, not only the first `20` names returned by Kaggle: live session `#162` uploaded the correct CherryFlash bundle, but the first page contained only early asset names and omitted `payload.json`, so a first-page-only check falsely declared the dataset “not ready” and aborted the run before `kernels_push`.
   - once `kernels_push` returns the actual Kaggle slug (for CherryFlash: `zigomaro/cherryflash`), the session must persist that real slug immediately, before the dataset-bind wait finishes; otherwise recovery/poller paths fall back to the repo-local pseudo-ref `local:CherryFlash`, which cannot be queried via Kaggle `kernels_status`.
   - startup recovery must not resume Kaggle status polling for still-local refs like `local:CherryFlash`; if the runtime restarted before the real slug was persisted, the session should fail closed as rerun-required instead of hanging in `RENDERING`.
-  - the post-push `dataset_sources` bind check for CherryFlash is telemetry, not a pre-start fatal gate: live session `#163` proved that Kaggle may successfully deploy and start `zigomaro/cherryflash` while `GetKernel` still reports only the static secret datasets in metadata, so CherryFlash must continue into normal kernel status/output polling after a successful `kernels_push` instead of marking the whole run failed at that intermediate metadata state.
+  - that fail-close path must keep a short handoff grace window for fresh CherryFlash runs: if recovery sees `local:CherryFlash` almost immediately after session start, it should allow the in-flight handoff to settle before declaring the run dead, because the April 22, 2026 incident showed that Kaggle can already continue and publish stories while sqlite still momentarily reflects the pre-handoff local ref.
+  - the post-push `dataset_sources` bind check for CherryFlash is now a fail-closed launch gate: before the server records a non-local handoff, Kaggle metadata must confirm the fresh per-run `cherryflash-session-*` dataset is attached to `zigomaro/cherryflash`. The April 27, 2026 catch-up showed that preserving an older session dataset can let Kaggle execute a stale mounted bundle while the server believes a fresh daily run started.
+  - when deploying `zigomaro/cherryflash`, older `cherryflash-session-*` dataset sources must be pruned from kernel metadata while static secret inputs are preserved, then the fresh session dataset must be added as the only per-run CherryFlash source. If the bind wait does not confirm that exact fresh dataset, the session must fail before `_store_kaggle_meta()` persists the handoff.
   - the launcher must treat Kaggle `SaveKernel` response fields as authoritative launch state, not just the absence of an HTTP exception:
     - a non-empty `error` in `ApiSaveKernelResponse` means the push failed, even if the Python API call returned normally;
     - live sessions `#164+` showed that CherryFlash can silently stay on a stale notebook version when `save_kernel` returns `Maximum weekly GPU quota ... reached`, so CherryFlash must not log that push as successful;
@@ -70,6 +72,11 @@
   - `--no-wait` is not a valid CherryFlash live-run mode: `start_render()` hands the real Kaggle push to a background asyncio task, so exiting the runner immediately after session creation kills the render before any visible Kaggle kernel run can appear.
   - for stale local prod snapshots, the runner may reset an already stuck `RENDERING` video session only through its explicit `--force-reset-rendering` flag before the new CherryFlash start.
   - Kaggle dataset/kernel API failures on this path must surface the raw Kaggle response body in logs instead of a bare `400/403`, so auth and dataset-contract incidents are diagnosable without a second repro pass.
+- scheduled CherryFlash launch contract:
+  - manual/operator launch may still use a background render task so the Telegram UI stays responsive;
+  - scheduled `popular_review` must wait through the pre-Kaggle phase until `videoannounce_session.kaggle_dataset` is set and `kaggle_kernel_ref` is a real Kaggle slug such as `zigomaro/cherryflash`;
+  - `ops_run(kind='video_popular_review')` must not be marked `success` while the session is still local-only (`local:CherryFlash`);
+  - same-day startup/watchdog catch-up must retry a missed CherryFlash slot when today's matching session failed before handoff, but must skip duplicate reruns when a remote dataset/kernel handoff already exists for today's slot, even if the local session status later became misleading.
 - Product runtime split:
   - candidate selection comes from the `/popular_posts`-style popularity pool with weekly anti-repeat;
   - CherryFlash selection is `future-start-only`: events whose `start date` is already before the current local day must not appear in the ribbon/date strip even if they still have a later `end_date`;
@@ -548,6 +555,12 @@ This section captures the latest intro-direction request as an explicit delta to
 - The anti-repeat rule is mode-specific:
   - regular `/v tomorrow` history must not silently block this mode forever;
   - this mode must not rely on the current global "seen in any `/v` session" behavior without an explicit time window.
+- CherryFlash cooldown must be publication-based, not failure-based:
+  - a failed-only run that never reached a published CherryFlash output must not start the `7`-day cooldown by itself;
+  - published CherryFlash outputs must still start cooldown even for legacy rows where `published_at` was missing and only `created_at` survived.
+- Cooldown is a hard exclusion, not a filler preference:
+  - once an event is inside the active CherryFlash cooldown window, selection must skip it entirely;
+  - the selector must not re-add cooldowned events via any `repeat_fill` / "not enough fresh picks" fallback.
 
 ### 4. Ranking
 
@@ -668,7 +681,12 @@ This section captures the latest intro-direction request as an explicit delta to
   - the current CherryFlash story fanout is an ordered repost chain:
     - first upload to `@kenigevents`;
     - then after `600` seconds repost to `@lovekenig`;
-    - then after another `600` seconds repost to `@loving_guide39`.
+    - then after another `600` seconds repost to `@loving_guide39`;
+    - then each configured encrypted Telegram Business target is posted through Bot API `postStory` after its own `600` second delay, without writing account usernames, user ids, or `business_connection_id` into code/docs/config artifacts.
+  - Business targets are resolved from `TELEGRAM_BUSINESS_CONNECTIONS_FILE` and a runtime DB allowlist in `setting.video_announce_story_business_targets`; personal account handles must stay out of repo env/docs/code.
+  - Business targets are mandatory for a configured CherryFlash fanout: they must be marked `blocking=true` and `required=true`, and their encrypted Bot API secrets must be co-located with the session `story_publish.json` inside the same `cherryflash-session-*` dataset so Kaggle cannot preflight against stale static story secrets.
+  - Business story posts must pass Bot API `post_to_chat_page=true`; without it, Telegram can accept `postStory` and show an active story while not exposing it on the account page/profile story list in the expected way.
+  - Kaggle story runtime startup must log enough non-secret matching evidence to diagnose publication fanout before render starts: config/cipher/key paths, target labels already present in `story_publish.json`, business target count, encrypted business secret count, and missing business connection hashes. Raw `business_connection_id`, Telegram user ids, bot tokens, and personal account handles must not be printed.
 - Sibling profile rule:
   - `cherryflash_libsvtav1` reuses the same common story path but requests `story_publish_enabled=true` by default in its session params;
   - actual story publication still depends on the shared global story infra (`build_story_publish_config()` and secret datasets) being available for that run.
@@ -688,6 +706,19 @@ This section captures the latest intro-direction request as an explicit delta to
   - winning window;
   - cooldown skip reason if excluded.
 - Anti-repeat queries must become time-aware and mode-aware.
+- Anti-repeat evidence should stay inspectable from session rows:
+  - `PUBLISHED_TEST` / `PUBLISHED_MAIN` sessions should carry a publication timestamp usable by CherryFlash cooldown queries;
+  - selection traces should continue to show whether a chosen event was `fresh` rather than a hidden fallback repeat.
+- Poster eligibility must be durable before render handoff:
+  - candidates with no renderable `photo_urls` must be skipped before session launch;
+  - if selection rehydrates poster URLs from a Telegram/VK source post, those URLs must be written back to the event row before session items and `payload.json` are built, because the render path reloads events from SQLite.
+  - if SQLite is temporarily locked while writing rehydrated poster URLs, CherryFlash must retry for a bounded window and then skip only that candidate if the repair still cannot be made durable; the whole popularity run must not crash on one locked poster write.
+- Viewer-facing success and local session status must not drift silently:
+  - a CherryFlash run that already reached successful Kaggle/story completion must not stay locally marked as pre-handoff `FAILED`;
+  - incident triage on this surface must use both prod sqlite and Kaggle output evidence, because the remote render may outlive a brief runtime recovery race.
+- Service diagnostics must stay off the publish channel:
+  - `test_chat_id` / `main_chat_id` are viewer-facing delivery targets, not a fallback for recovery alerts;
+  - CherryFlash restart/service notifications must go only to the explicit operator/admin notify chat (`selection_params.notify_chat_id`) or, if that context is absent, to the resolved superadmin DM.
 
 ## Acceptance checklist
 
@@ -713,7 +744,7 @@ This section captures the latest intro-direction request as an explicit delta to
 - [ ] The phone-screen CTA stack reads in depth above/below the poster without text-on-text collisions.
 - [ ] Critical CTA/date/city content stays inside story-safe bounds and avoids common Telegram / Instagram story UI overlay zones.
 - [ ] Phase-1 fallback publication to `@keniggpt` remains available for validation/debug runs when story rollout is intentionally bypassed.
-- [ ] Story autopublish publishes the current ordered fanout `@kenigevents -> @lovekenig -> @loving_guide39` through the shared repost-capable helper path.
+- [ ] Story autopublish publishes the current ordered fanout `@kenigevents -> @lovekenig -> @loving_guide39 -> encrypted Telegram Business targets` through the shared helper path, preserving `600` second spacing between all targets.
 - [ ] `cherryflash_libsvtav1` requests story publish by default while still using the same shared CherryFlash story helper path.
 - [ ] The target operating expectation remains that the story fanout is already published by `12:30 Europe/Kaliningrad`.
 
@@ -735,6 +766,7 @@ This section captures the latest intro-direction request as an explicit delta to
   - the current Kaggle preproduction entrypoint must remain compatible with Kaggle's bundled `moviepy` layout, because the approval clip assembly happens inside `scripts/render_mobilefeed_intro_scene1_approval.py` in the remote runtime;
   - CherryFlash runtime payloads may carry viewer-facing formatted dates inside the selection manifest, so intro/scene loaders must accept either ISO dates or preformatted date strings and must not crash on already-rendered copies such as `3 мая`;
   - the launcher/runtime path must tolerate mixed ORM + `raw_conn()` access on the same SQLite DB during live popularity selection; if SQLite temporarily refuses `PRAGMA journal_mode=...` with `database is locked`, CherryFlash should continue rather than abort before the session is even created;
+  - rehydrated poster persistence must also tolerate transient SQLite locks: retry, require a durable event-row write before selecting the candidate, and skip the candidate rather than selecting an event that will reload as no-photo in `payload.json`;
   - canonical kernel ref for the current preproduction route: `zigomaro/cherryflash`;
   - the existing `CrumpleVideo` runtime remains separate and must not be used as the CherryFlash render/notebook home.
 - Current working refinement track for approval:

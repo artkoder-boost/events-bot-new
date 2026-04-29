@@ -12,8 +12,9 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from models import Channel
+from models import Channel, Setting
 from source_parsing.telegram.split_secrets import encrypt_secret
+from telegram_business import load_business_story_targets
 from .kaggle_client import KaggleClient
 
 logger = logging.getLogger(__name__)
@@ -34,14 +35,30 @@ class StoryTarget:
     label: str
     delay_seconds: int = 0
     mode: str = "upload"
+    blocking: bool | None = None
+    required: bool = False
+    transport: str = "telethon"
+    business_connection_hash: str = ""
+    user_hash: str = ""
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "peer": self.peer,
             "label": self.label,
             "delay_seconds": self.delay_seconds,
             "mode": self.mode,
         }
+        if self.blocking is not None:
+            payload["blocking"] = bool(self.blocking)
+        if self.required:
+            payload["required"] = True
+        if self.transport != "telethon":
+            payload["transport"] = self.transport
+        if self.business_connection_hash:
+            payload["business_connection_hash"] = self.business_connection_hash
+        if self.user_hash:
+            payload["user_hash"] = self.user_hash
+        return payload
 
 
 def _read_env_file_value(key: str) -> str | None:
@@ -197,12 +214,41 @@ def _story_session_payload() -> dict[str, Any]:
 
 def build_story_secrets_payload() -> str:
     payload = _story_session_payload()
+    business_targets = _load_business_story_targets(selector_raw="all")
+    if business_targets:
+        bot_token = _require_env_any("TELEGRAM_BOT_TOKEN")
+        payload["business_bot_token"] = bot_token
+        payload["business_connections"] = [
+            {
+                "connection_hash": item["connection_hash"],
+                "user_hash": item.get("user_hash") or "",
+                "connection_id": item["connection_id"],
+                "user_chat_id": item.get("user_chat_id"),
+                "is_enabled": bool(item.get("is_enabled")),
+                "can_manage_stories": bool(item.get("can_manage_stories")),
+            }
+            for item in business_targets
+        ]
     logger.info(
-        "video_announce.story secrets auth_source=%s has_session=%s",
+        "video_announce.story secrets auth_source=%s has_session=%s business_targets=%s",
         payload.get("auth_source") or "-",
         bool(payload.get("session")),
+        len(business_targets),
     )
     return json.dumps(payload, ensure_ascii=False)
+
+
+def write_story_secret_files(target_dir: Path) -> tuple[Path, Path]:
+    payload = build_story_secrets_payload()
+    encrypted, key = encrypt_secret(payload)
+    if not encrypted or not key:
+        raise RuntimeError("Failed to encrypt story secrets payload")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    cipher_path = target_dir / STORY_PUBLISH_CIPHER_FILENAME
+    key_path = target_dir / STORY_PUBLISH_KEY_FILENAME
+    cipher_path.write_bytes(encrypted)
+    key_path.write_bytes(key)
+    return cipher_path, key_path
 
 
 def _normalize_dataset_slug(config_key: str, default_slug: str) -> str:
@@ -295,7 +341,10 @@ def _dedupe_targets(targets: list[StoryTarget]) -> list[StoryTarget]:
     seen: set[str] = set()
     deduped: list[StoryTarget] = []
     for target in targets:
-        key = target.peer.casefold()
+        if target.transport == "telegram_business":
+            key = f"business:{target.business_connection_hash}"
+        else:
+            key = f"telethon:{target.peer.casefold()}"
         if key in seen:
             continue
         seen.add(key)
@@ -316,6 +365,8 @@ def _parse_targets_json_env(env_key: str) -> list[StoryTarget]:
 
     targets: list[StoryTarget] = []
     for idx, item in enumerate(payload):
+        blocking: bool | None = None
+        required = False
         if isinstance(item, str):
             peer = _normalize_peer(item)
             label = peer or f"extra-{idx + 1}"
@@ -332,6 +383,16 @@ def _parse_targets_json_env(env_key: str) -> list[StoryTarget]:
                 ) from exc
             raw_mode = str(item.get("mode") or item.get("publish_mode") or "upload").strip().lower()
             mode = raw_mode if raw_mode in {"upload", "repost_previous"} else "upload"
+            raw_blocking = item.get("blocking")
+            if isinstance(raw_blocking, bool):
+                blocking = raw_blocking
+            elif raw_blocking is not None:
+                raise RuntimeError(f"{env_key}[{idx}].blocking must be bool")
+            raw_required = item.get("required")
+            if isinstance(raw_required, bool):
+                required = raw_required
+            elif raw_required is not None:
+                raise RuntimeError(f"{env_key}[{idx}].required must be bool")
         else:
             raise RuntimeError(f"{env_key} items must be strings or objects")
         if not peer:
@@ -342,6 +403,8 @@ def _parse_targets_json_env(env_key: str) -> list[StoryTarget]:
                 label=label.strip() or peer,
                 delay_seconds=delay_seconds,
                 mode=mode,
+                blocking=blocking,
+                required=required,
             )
         )
     return targets
@@ -365,6 +428,8 @@ def _parse_selection_targets(selection_params: dict[str, Any] | None) -> list[St
 
     targets: list[StoryTarget] = []
     for idx, item in enumerate(payload):
+        blocking: bool | None = None
+        required = False
         if isinstance(item, str):
             peer = _normalize_peer(item)
             label = peer or f"override-{idx + 1}"
@@ -381,6 +446,16 @@ def _parse_selection_targets(selection_params: dict[str, Any] | None) -> list[St
                 ) from exc
             raw_mode = str(item.get("mode") or item.get("publish_mode") or "upload").strip().lower()
             mode = raw_mode if raw_mode in {"upload", "repost_previous"} else "upload"
+            raw_blocking = item.get("blocking")
+            if isinstance(raw_blocking, bool):
+                blocking = raw_blocking
+            elif raw_blocking is not None:
+                raise RuntimeError(f"{env_key}[{idx}].blocking must be bool")
+            raw_required = item.get("required")
+            if isinstance(raw_required, bool):
+                required = raw_required
+            elif raw_required is not None:
+                raise RuntimeError(f"{env_key}[{idx}].required must be bool")
         else:
             raise RuntimeError(f"{env_key}[{idx}] items must be strings or objects")
         if not peer:
@@ -391,6 +466,78 @@ def _parse_selection_targets(selection_params: dict[str, Any] | None) -> list[St
                 label=label.strip() or peer,
                 delay_seconds=delay_seconds,
                 mode=mode,
+                blocking=blocking,
+                required=required,
+            )
+        )
+    return targets
+
+
+def _business_modes() -> set[str]:
+    raw = (_get_env_value("VIDEO_ANNOUNCE_STORY_BUSINESS_MODES") or "").strip()
+    if not raw:
+        raw = "popular_review,cherryflash_libsvtav1"
+    return {item.strip().casefold() for item in raw.split(",") if item.strip()}
+
+
+def _business_targets_allowed_for_mode(selection_params: dict[str, Any]) -> bool:
+    mode = str(selection_params.get("mode") or "").strip().casefold()
+    return bool(mode and mode in _business_modes())
+
+
+def _business_target_delay_seconds() -> int:
+    return _read_positive_int_env("VIDEO_ANNOUNCE_STORY_BUSINESS_DELAY_SECONDS", 600)
+
+
+BUSINESS_TARGETS_SETTING_KEY = "video_announce_story_business_targets"
+
+
+def _load_business_story_targets(selector_raw: str | None) -> list[dict[str, Any]]:
+    return load_business_story_targets(selector_raw=selector_raw)
+
+
+async def _business_targets_setting_raw(
+    db,
+    selection_params: dict[str, Any],
+) -> str:
+    override = selection_params.get("story_business_targets")
+    if isinstance(override, str):
+        return override
+    if isinstance(override, list):
+        return json.dumps(override, ensure_ascii=False)
+    if db is None:
+        return ""
+    async with db.get_session() as session:
+        setting = await session.get(Setting, BUSINESS_TARGETS_SETTING_KEY)
+        return str(setting.value or "") if setting else ""
+
+
+async def _business_story_targets(
+    db,
+    selection_params: dict[str, Any],
+) -> list[StoryTarget]:
+    if not _business_targets_allowed_for_mode(selection_params):
+        return []
+    selector_raw = await _business_targets_setting_raw(db, selection_params)
+    if not selector_raw.strip():
+        return []
+    delay_seconds = _business_target_delay_seconds()
+    targets: list[StoryTarget] = []
+    for item in _load_business_story_targets(selector_raw=selector_raw):
+        connection_hash = str(item.get("connection_hash") or "").strip()
+        if not connection_hash:
+            continue
+        targets.append(
+            StoryTarget(
+                peer=f"business:{connection_hash}",
+                label=f"business:{connection_hash}",
+                delay_seconds=delay_seconds,
+                mode="upload",
+                blocking=True,
+                required=True,
+                transport="telegram_business",
+                business_connection_hash=connection_hash,
+                user_hash=str(item.get("user_hash") or "").strip(),
             )
         )
     return targets
@@ -480,6 +627,7 @@ async def build_story_publish_config(
         if main_target:
             targets.append(main_target)
         targets.extend(_parse_extra_targets_json())
+    targets.extend(await _business_story_targets(db, selection_params))
     targets = _dedupe_targets(targets)
     if not targets:
         logger.info("video_announce.story: enabled but no targets configured")

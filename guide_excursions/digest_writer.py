@@ -16,7 +16,7 @@ from .editorial import (
     repair_title_fallback,
 )
 from .identity_policy import guide_line_is_publishable
-from .llm_support import GuideSecretsProviderAdapter, guide_account_name, resolve_candidate_key_ids
+from .llm_support import GuideSecretsProviderAdapter, env_int_clamped, guide_account_name, resolve_candidate_key_ids
 from .parser import collapse_ws
 
 logger = logging.getLogger(__name__)
@@ -44,6 +44,18 @@ GUIDE_DIGEST_WRITER_BATCH_SIZE = max(
 GUIDE_DIGEST_WRITER_MAX_WAIT_SECONDS = max(
     30,
     min(int((os.getenv("GUIDE_DIGEST_WRITER_MAX_WAIT_SECONDS") or "240") or 240), 1800),
+)
+GUIDE_DIGEST_WRITER_LLM_TIMEOUT_SECONDS = env_int_clamped(
+    "GUIDE_DIGEST_WRITER_LLM_TIMEOUT_SEC",
+    120,
+    minimum=30,
+    maximum=600,
+)
+GUIDE_DIGEST_WRITER_TOTAL_TIMEOUT_SECONDS = env_int_clamped(
+    "GUIDE_DIGEST_WRITER_TOTAL_TIMEOUT_SEC",
+    45,
+    minimum=10,
+    maximum=600,
 )
 _BANNED_HYPE_STEMS = [
     "уникаль",
@@ -583,16 +595,19 @@ async def _ask_digest_batch_llm_batch(
     waited_seconds = 0.0
     for attempt in range(6):
         try:
-            raw, _usage = await client.generate_content_async(
-                model=GUIDE_DIGEST_WRITER_MODEL,
-                prompt=prompt,
-                generation_config={
-                    "temperature": 0.2,
-                    "response_mime_type": "application/json",
-                    "response_schema": schema,
-                },
-                max_output_tokens=2400,
-                candidate_key_ids=list(candidate_key_ids) if candidate_key_ids else None,
+            raw, _usage = await asyncio.wait_for(
+                client.generate_content_async(
+                    model=GUIDE_DIGEST_WRITER_MODEL,
+                    prompt=prompt,
+                    generation_config={
+                        "temperature": 0.2,
+                        "response_mime_type": "application/json",
+                        "response_schema": schema,
+                    },
+                    max_output_tokens=2400,
+                    candidate_key_ids=list(candidate_key_ids) if candidate_key_ids else None,
+                ),
+                timeout=float(GUIDE_DIGEST_WRITER_LLM_TIMEOUT_SECONDS),
             )
             break
         except Exception as exc:
@@ -677,7 +692,15 @@ async def apply_digest_batch_copy(
                 "post_excerpt": collapse_ws(str(item.get("dedup_source_text") or ""))[:520],
             }
         )
-    llm_out = await _ask_digest_batch_llm(payload_rows) if payload_rows else None
+    llm_out = None
+    if payload_rows:
+        try:
+            llm_out = await asyncio.wait_for(
+                _ask_digest_batch_llm(payload_rows),
+                timeout=float(GUIDE_DIGEST_WRITER_TOTAL_TIMEOUT_SECONDS),
+            )
+        except Exception as exc:
+            logger.warning("guide_digest_writer: total budget failed open: %s", exc)
     out: list[dict[str, Any]] = []
     for item in prepared:
         occurrence_id = int(item.get("id") or 0)

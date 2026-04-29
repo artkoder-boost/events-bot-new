@@ -17,7 +17,7 @@ from sqlalchemy.exc import OperationalError
 
 from db import Database
 from event_utils import strip_city_from_address
-from location_reference import normalise_event_location_from_reference
+from location_reference import find_known_venue_in_text, normalise_event_location_from_reference
 from models import (
     Channel,
     EventMediaAsset,
@@ -1035,7 +1035,11 @@ _ESOTERICA_RE = re.compile(
     r"чакр(а|ы)|энерг(ия|етик)|рейки|регресси(я|и)|родов(ая|ые)\\s+программ)\\b",
     re.IGNORECASE,
 )
-_BRIDGE_RE = re.compile(r"\bразвод(ка)?\\s+мост(ов|ы)\\b", re.IGNORECASE)
+_BRIDGE_RE = re.compile(
+    r"\b(?:развод(?:ка|ки|ке|ку)?\s+мост(?:ов|ы|а)?|разводк[аеуи]\s+мостов|"
+    r"развест[и]\s+мосты|разведут\s+мосты|мосты\s+разведут)\b",
+    re.IGNORECASE,
+)
 
 
 def _date_tokens_from_iso(iso_date: str | None) -> list[str]:
@@ -2332,6 +2336,18 @@ _BAD_TITLE_RE = re.compile(r"^\s*[\W_]*\(?\s*\d*\s*(?:мест[ао]?)?\s*\)?\s*
 _ADDRESS_HINT_RE = re.compile(
     r"(?i)\b(ул\.|улица|пр-т|проспект|пл\.|площад|пер\.|переулок|наб\.|набереж|шоссе|бульвар|дом)\b"
 )
+_LOCATION_PROSE_VERB_RE = re.compile(
+    r"(?iu)\b("
+    r"анонсирован\w*|представ\w*|расскаж\w*|покаж\w*|приглаша\w*|"
+    r"пройд[её]т|состоится|переносится|запланирован\w*|нужда[ею]тся|"
+    r"выигра\w*|созда\w*|дарим|открыва\w*|пиш\w*|можно|будут|"
+    r"известн\w*|телерадиоведущ\w*|концертмейстер\w*"
+    r")\b"
+)
+_LOCATION_PROSE_START_RE = re.compile(
+    r"(?iu)^\s*(?:которые|известн\w*|дарим|вместо|по\s+решению|это|аниме|мультфильм|"
+    r"мастер[- ]?класс\w*|немого\s+кино|которые\s+не)\b"
+)
 _CITY_PREFIX_RE = re.compile(
     r"(?i)^\s*(?:г\.?|город|пос\.?|посёлок|поселок|пгт|село|деревня)\s+"
 )
@@ -2546,6 +2562,38 @@ def _infer_location_from_poster_payloads(payload: list[dict[str, Any]] | None) -
             if inferred_name:
                 return inferred_name, inferred_addr
     return None, None
+
+
+def _looks_like_location_prose_fragment(value: str | None) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    if "\n" in raw:
+        return True
+    compact = re.sub(r"\s+", " ", raw)
+    words = re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", compact)
+    if len(compact) > 90:
+        return True
+    if "|" in compact or re.search(r"\b\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?\b", compact):
+        return True
+    if re.fullmatch(r"\d{4}\s*\([^)]{3,40}\)", compact):
+        return True
+    if _LOCATION_PROSE_START_RE.search(compact):
+        return True
+    if len(words) >= 8 and not _ADDRESS_HINT_RE.search(compact):
+        return True
+    if len(words) >= 4 and _LOCATION_PROSE_VERB_RE.search(compact):
+        return True
+    if len(words) >= 4 and re.search(r"[.!?]\s*$", compact):
+        return True
+    return False
+
+
+def _known_venue_payload_from_text(text: str | None, *, city: str | None = None) -> tuple[str | None, str | None, str | None]:
+    venue = find_known_venue_in_text(text, city=city)
+    if venue is None:
+        return None, None, None
+    return venue.name or None, venue.address or None, venue.city or None
 
 
 _BOOKING_HANDLE_RE = re.compile(
@@ -3036,6 +3084,90 @@ async def _is_message_scanned(
         return await session.get(TelegramScannedMessage, (source_id, message_id))
 
 
+def _parse_event_payload_date(value: Any) -> date | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(raw[:10])
+    except Exception:
+        return None
+
+
+def _event_payload_can_still_be_imported(event_data: Any, *, today: date | None = None) -> bool:
+    if not isinstance(event_data, dict):
+        return False
+    current = today or date.today()
+    start = _parse_event_payload_date(event_data.get("date"))
+    end = _parse_event_payload_date(event_data.get("end_date"))
+    if end is not None:
+        return end >= current
+    if start is None:
+        return True
+    return start >= current
+
+
+def _has_reprocessable_event_payload(events: Any) -> bool:
+    if not isinstance(events, list):
+        return False
+    return any(_event_payload_can_still_be_imported(event_data) for event_data in events)
+
+
+async def _source_url_already_attached(db: Database, source_url: str | None) -> bool:
+    clean = str(source_url or "").strip()
+    if not clean:
+        return False
+    async with db.get_session() as session:
+        row = (
+            await session.execute(
+                select(EventSource.id)
+                .where(EventSource.source_url == clean)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+    return row is not None
+
+
+async def _should_reprocess_incomplete_scan(
+    db: Database,
+    *,
+    existing: TelegramScannedMessage,
+    source_url: str | None,
+    events: Any,
+) -> bool:
+    status = str(getattr(existing, "status", "") or "").strip().lower()
+    if status not in {"skipped", "partial", "error"}:
+        return False
+    if str(getattr(existing, "error", "") or "").strip():
+        return False
+    try:
+        extracted = int(getattr(existing, "events_extracted", 0) or 0)
+        imported = int(getattr(existing, "events_imported", 0) or 0)
+    except Exception:
+        return False
+    if extracted <= 0 or imported >= extracted:
+        return False
+    if not _has_reprocessable_event_payload(events):
+        return False
+    if imported <= 0 and await _source_url_already_attached(db, source_url):
+        return False
+    return True
+
+
+def _scan_error_from_breakdown(
+    status: str,
+    skip_breakdown: dict[str, int] | defaultdict[str, int] | None,
+) -> str | None:
+    if status not in {"skipped", "partial", "error"}:
+        return None
+    if not skip_breakdown:
+        return None
+    payload = {
+        "skip_breakdown": dict(sorted(dict(skip_breakdown).items())),
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
 async def _mark_message_scanned(
     db: Database,
     *,
@@ -3146,6 +3278,8 @@ def _build_candidate(
     event_type = _normalize_event_type(event_data.get("event_type"))
     emoji = event_data.get("emoji")
     is_free = event_data.get("is_free")
+    if ticket_price_min == 0 and ticket_price_max in (0, None):
+        is_free = True
     pushkin_card = event_data.get("pushkin_card")
     search_digest = event_data.get("search_digest") or event_data.get("search_description")
 
@@ -3262,13 +3396,45 @@ def _build_candidate(
     poster_loc, poster_addr = _infer_location_from_poster_payloads(
         assigned_posters_payload or posters_payload or message_posters_payload
     )
+    probe_for_known_location = "\n".join(
+        str(part)
+        for part in (
+            message_text_s,
+            event_source_text,
+            event_source_text_raw,
+            raw_excerpt,
+        )
+        if str(part or "").strip()
+    )
+    known_loc, known_addr, known_city = _known_venue_payload_from_text(
+        probe_for_known_location,
+        city=str(extracted_city or "").strip() or None,
+    )
+    if location_name and _looks_like_location_prose_fragment(location_name):
+        logger.warning(
+            "telegram: dropped prose-like extracted location source=%s message_id=%s title=%r location=%r",
+            username,
+            message_id,
+            title,
+            location_name,
+        )
+        location_name = source.default_location or known_loc
+        if known_addr and not location_address:
+            location_address = known_addr
+        if known_city and not extracted_city:
+            extracted_city = known_city
+        if extracted_location and _looks_like_location_prose_fragment(extracted_location):
+            extracted_location = None
+
     if not location_name:
-        fallback_loc = inferred_loc or poster_loc
-        fallback_addr = inferred_addr or poster_addr
+        fallback_loc = inferred_loc or poster_loc or known_loc
+        fallback_addr = inferred_addr or poster_addr or known_addr
         if fallback_loc:
             location_name = fallback_loc
             if fallback_addr and not location_address:
                 location_address = fallback_addr
+            if known_city and not extracted_city:
+                extracted_city = known_city
             logger.info(
                 "telegram: inferred missing location source=%s message_id=%s title=%r location=%r",
                 username,
@@ -4599,43 +4765,59 @@ async def process_telegram_results(
                 )
 
         if existing and not forced:
-            report.messages_metrics_only += 1
-            report.events_extracted_metrics_only += int(existing.events_extracted or 0)
-            logger.info(
-                "tg_monitor.message metrics_only run_id=%s source=%s message_id=%s",
-                report.run_id,
-                username,
-                message_id,
-            )
-            info = TelegramMonitorSkippedPostInfo(
-                source_username=username,
-                source_title=source_title or None,
-                message_id=message_id,
-                source_link=source_link,
-                status="metrics_only",
-                reason="already_scanned",
-                events_extracted=int(existing.events_extracted or 0),
-                events_imported=int(existing.events_imported or 0),
-                skip_breakdown={"metrics_only": 1},
-                event_titles=[],
-                source_excerpt=_build_excerpt(source_text),
-                metrics=metrics,
-                popularity=popularity,
-            )
-            report.metrics_only_posts.append(info)
-            if popularity:
-                report.popular_posts.append(info)
-            await _update_source_scan_meta(db, int(source.id), int(message_id))
-            await _notify_done(
-                status="metrics_only",
-                reason="already_scanned",
-                events_extracted_override=int(existing.events_extracted or 0),
-                events_imported_override=int(existing.events_imported or 0),
-                metrics_payload=metrics,
-                popularity_payload=popularity,
-                skip_breakdown_payload={"metrics_only": 1},
-            )
-            continue
+            if await _should_reprocess_incomplete_scan(
+                db,
+                existing=existing,
+                source_url=source_link,
+                events=events,
+            ):
+                logger.info(
+                    "tg_monitor.message reprocess_incomplete_scan run_id=%s source=%s message_id=%s status=%s extracted=%s imported=%s",
+                    report.run_id,
+                    username,
+                    message_id,
+                    existing.status,
+                    existing.events_extracted,
+                    existing.events_imported,
+                )
+            else:
+                report.messages_metrics_only += 1
+                report.events_extracted_metrics_only += int(existing.events_extracted or 0)
+                logger.info(
+                    "tg_monitor.message metrics_only run_id=%s source=%s message_id=%s",
+                    report.run_id,
+                    username,
+                    message_id,
+                )
+                info = TelegramMonitorSkippedPostInfo(
+                    source_username=username,
+                    source_title=source_title or None,
+                    message_id=message_id,
+                    source_link=source_link,
+                    status="metrics_only",
+                    reason="already_scanned",
+                    events_extracted=int(existing.events_extracted or 0),
+                    events_imported=int(existing.events_imported or 0),
+                    skip_breakdown={"metrics_only": 1},
+                    event_titles=[],
+                    source_excerpt=_build_excerpt(source_text),
+                    metrics=metrics,
+                    popularity=popularity,
+                )
+                report.metrics_only_posts.append(info)
+                if popularity:
+                    report.popular_posts.append(info)
+                await _update_source_scan_meta(db, int(source.id), int(message_id))
+                await _notify_done(
+                    status="metrics_only",
+                    reason="already_scanned",
+                    events_extracted_override=int(existing.events_extracted or 0),
+                    events_imported_override=int(existing.events_imported or 0),
+                    metrics_payload=metrics,
+                    popularity_payload=popularity,
+                    skip_breakdown_payload={"metrics_only": 1},
+                )
+                continue
         if forced:
             report.messages_forced += 1
         else:
@@ -5216,7 +5398,7 @@ async def process_telegram_results(
             status=final_status,
             events_extracted=events_extracted,
             events_imported=events_imported,
-            error=None,
+            error=_scan_error_from_breakdown(final_status, skip_breakdown),
         )
         if popularity:
             # Keep a short list of posts whose metrics exceed per-channel baselines.

@@ -165,6 +165,12 @@ import httpx
 import hashlib
 import unicodedata
 from html import escape
+from telegram_business import (
+    WEBHOOK_ALLOWED_UPDATES,
+    cache_business_connection,
+    load_cached_business_connections,
+    secure_short_hash,
+)
 import vk_intake
 import vk_review
 import poster_ocr
@@ -797,6 +803,8 @@ daily_time_sessions: TTLCache[int, int] = TTLCache(maxsize=64, ttl=3600)
 vk_group_sessions: set[int] = set()
 # user_id -> section (today/added) for VK time update
 vk_time_sessions: TTLCache[int, str] = TTLCache(maxsize=64, ttl=3600)
+# user_id -> connection_hash for /check_business test story flow
+check_business_sessions: TTLCache[int, str] = TTLCache(maxsize=32, ttl=600)
 # user_id -> vk_source_id for default time update
 @dataclass
 class VkDefaultTimeSession:
@@ -5675,7 +5683,14 @@ def _compose_event_location(
     drop_city = False
     if city_value:
         if city_norm and len(city_norm) >= 4:
-            drop_city = city_norm in name_norm or city_norm in address_norm
+            city_tokens = city_norm.split()
+            drop_city = (
+                bool(city_tokens)
+                and (
+                    _contains_token_subsequence(name_norm.split(), city_tokens)
+                    or _contains_token_subsequence(address_norm.split(), city_tokens)
+                )
+            )
         if not drop_city and re.search(
             r"(?i)\b(ул\.?|улица|просп\.?|пр-т|проспект|дом|д\.|корп\.?|корпус|кв\.?|\d)\b",
             city_value,
@@ -8911,7 +8926,11 @@ async def _parse_event_via_gemma(
         + "CRITICAL: No comments. No markdown. No trailing commas. No text outside JSON.\n\n"
         + user_msg
     )
-    model = (os.getenv("EVENT_PARSE_GEMMA_MODEL", "gemma-3-27b-it") or "").strip() or "gemma-3-27b-it"
+    model = (
+        str(extra.get("gemma_model") or "").strip()
+        or (os.getenv("EVENT_PARSE_GEMMA_MODEL", "gemma-3-27b-it") or "").strip()
+        or "gemma-3-27b-it"
+    )
     max_tokens = int(os.getenv("EVENT_PARSE_GEMMA_MAX_TOKENS", "2200") or "2200")
     max_tokens = max(400, min(max_tokens, 6000))
 
@@ -12062,6 +12081,339 @@ async def handle_my_chat_member(update: types.ChatMemberUpdated, db: Database):
             channel.username = getattr(update.chat, "username", None)
             channel.is_admin = is_admin
         await session.commit()
+
+
+def _format_business_connection_dm(summary: dict, *, source: str) -> str:
+    state = "включено" if summary.get("is_enabled") else "выключено"
+    stories = "✅" if summary.get("can_manage_stories") else "❌"
+    flag = "🆕 NEW" if summary.get("is_new") else "🔄 UPDATE"
+    return (
+        f"{flag} Telegram Business connection ({source})\n"
+        f"connection_hash: {summary.get('connection_hash')}\n"
+        f"user_hash: {summary.get('user_hash')}\n"
+        f"is_enabled: {state}\n"
+        f"can_manage_stories: {stories}"
+    )
+
+
+async def _notify_business_connection_change(
+    db: Database, bot: Bot, summary: dict, *, source: str, force: bool = False
+) -> None:
+    if not (force or summary.get("is_new") or summary.get("state_changed")):
+        return
+    try:
+        await notify_superadmin(db, bot, _format_business_connection_dm(summary, source=source))
+    except Exception:
+        logging.exception("business_connection DM notify failed")
+
+
+async def handle_business_connection(
+    update: types.BusinessConnection, db: Database, bot: Bot
+):
+    summary = {
+        "connection_hash": secure_short_hash(getattr(update, "id", "")),
+        "user_hash": secure_short_hash(getattr(getattr(update, "user", None), "id", "")),
+        "is_enabled": bool(getattr(update, "is_enabled", False)),
+        "can_manage_stories": bool(
+            getattr(getattr(update, "rights", None), "can_manage_stories", False)
+        ),
+    }
+    try:
+        summary = cache_business_connection(update)
+        logging.info(
+            "business_connection cached connection=%s user=%s enabled=%s can_manage_stories=%s path=%s is_new=%s",
+            summary.get("connection_hash"),
+            summary.get("user_hash"),
+            summary.get("is_enabled"),
+            summary.get("can_manage_stories"),
+            summary.get("path"),
+            summary.get("is_new"),
+        )
+        await _notify_business_connection_change(
+            db, bot, summary, source="business_connection", force=True
+        )
+    except Exception:
+        logging.exception(
+            "business_connection cache failed connection=%s user=%s enabled=%s can_manage_stories=%s",
+            summary.get("connection_hash"),
+            summary.get("user_hash"),
+            summary.get("is_enabled"),
+            summary.get("can_manage_stories"),
+        )
+
+
+async def handle_business_message_connection(
+    message: types.Message, db: Database, bot: Bot
+):
+    connection_id = str(getattr(message, "business_connection_id", "") or "").strip()
+    if not connection_id:
+        return
+    summary = {"connection_hash": secure_short_hash(connection_id)}
+    try:
+        connection = await bot.get_business_connection(business_connection_id=connection_id)
+        summary = cache_business_connection(connection)
+        logging.info(
+            "business_message connection cached connection=%s user=%s enabled=%s can_manage_stories=%s path=%s is_new=%s",
+            summary.get("connection_hash"),
+            summary.get("user_hash"),
+            summary.get("is_enabled"),
+            summary.get("can_manage_stories"),
+            summary.get("path"),
+            summary.get("is_new"),
+        )
+        await _notify_business_connection_change(
+            db, bot, summary, source="business_message"
+        )
+    except Exception:
+        logging.exception(
+            "business_message connection cache failed connection=%s",
+            summary.get("connection_hash"),
+        )
+
+
+_CHECK_BUSINESS_CB_PREFIX = "cbiz:"
+_CHECK_BUSINESS_ACTIVE_PERIOD = 21600  # 6h, минимально допустимое значение postStory
+
+
+def _check_business_label(item: dict) -> str:
+    username = str(item.get("username") or "").strip().lstrip("@")
+    if username:
+        return f"@{username}"
+    return f"hash:{str(item.get('connection_hash') or '')[:8]}"
+
+
+def _check_business_story_capable(items: list[dict]) -> list[dict]:
+    return [
+        item
+        for item in items
+        if bool(item.get("is_enabled"))
+        and bool(item.get("can_manage_stories"))
+        and str(item.get("connection_id") or "").strip()
+        and str(item.get("connection_hash") or "").strip()
+    ]
+
+
+async def handle_check_business(message: types.Message, db: Database, bot: Bot) -> None:
+    async with db.get_session() as session:
+        user = await session.get(User, message.from_user.id)
+        if not has_admin_access(user):
+            await bot.send_message(message.chat.id, "Not authorized")
+            return
+
+    try:
+        cached = load_cached_business_connections()
+    except Exception:
+        logging.exception("check_business: failed to load business cache")
+        await bot.send_message(
+            message.chat.id, "Не удалось прочитать кэш бизнес-подключений"
+        )
+        return
+    targets = _check_business_story_capable(cached)
+    if not targets:
+        await bot.send_message(
+            message.chat.id,
+            "Нет активных бизнес-подключений с правом на сторис.\n"
+            "Добавь @events_love39_bot в Business → Чат-боты у партнёра и включи "
+            "разрешение «Сторис», затем повтори команду.",
+        )
+        return
+
+    buttons: list[list[types.InlineKeyboardButton]] = []
+    for item in targets:
+        buttons.append(
+            [
+                types.InlineKeyboardButton(
+                    text=_check_business_label(item),
+                    callback_data=f"{_CHECK_BUSINESS_CB_PREFIX}{item['connection_hash']}",
+                )
+            ]
+        )
+    markup = types.InlineKeyboardMarkup(inline_keyboard=buttons)
+    await bot.send_message(
+        message.chat.id,
+        "Бизнес-подключения с правом на сторис. Выбери получателя — "
+        "я попрошу прислать картинку для теста.",
+        reply_markup=markup,
+    )
+
+
+async def handle_check_business_callback(
+    callback: types.CallbackQuery, db: Database, bot: Bot
+) -> None:
+    async with db.get_session() as session:
+        user = await session.get(User, callback.from_user.id)
+        if not has_admin_access(user):
+            await callback.answer("Not authorized", show_alert=True)
+            return
+
+    data = callback.data or ""
+    if not data.startswith(_CHECK_BUSINESS_CB_PREFIX):
+        await callback.answer()
+        return
+    connection_hash = data[len(_CHECK_BUSINESS_CB_PREFIX) :].strip()
+    if not connection_hash:
+        await callback.answer("Пустой connection_hash", show_alert=True)
+        return
+
+    try:
+        cached = load_cached_business_connections()
+    except Exception:
+        logging.exception("check_business cb: failed to load business cache")
+        await callback.answer("Не удалось прочитать кэш", show_alert=True)
+        return
+    match = next(
+        (
+            item
+            for item in cached
+            if str(item.get("connection_hash") or "").strip() == connection_hash
+        ),
+        None,
+    )
+    if not match:
+        await callback.answer(
+            "Подключение не найдено в кэше. Попроси партнёра переподключить бот.",
+            show_alert=True,
+        )
+        return
+    if not (match.get("is_enabled") and match.get("can_manage_stories")):
+        await callback.answer(
+            "Подключение неактивно или нет права на сторис",
+            show_alert=True,
+        )
+        return
+
+    check_business_sessions[callback.from_user.id] = connection_hash
+    label = _check_business_label(match)
+    await callback.answer()
+    if callback.message:
+        await callback.message.edit_text(
+            f"Выбрано: {label}\n"
+            "Пришли картинку 1080×1920 (.jpg/.png/.webp, до 10 MB) — "
+            f"опубликую её в сторис на {_CHECK_BUSINESS_ACTIVE_PERIOD // 3600} ч.\n"
+            "Команду /cancel — отменит ожидание."
+        )
+
+
+async def _post_business_story_photo(
+    *, bot: Bot, business_connection_id: str, photo_bytes: bytes, filename: str
+) -> dict:
+    import aiohttp
+
+    form = aiohttp.FormData()
+    form.add_field("business_connection_id", business_connection_id)
+    form.add_field(
+        "content",
+        json.dumps({"type": "photo", "photo": "attach://photo_attach"}, ensure_ascii=False),
+    )
+    form.add_field("active_period", str(_CHECK_BUSINESS_ACTIVE_PERIOD))
+    form.add_field("post_to_chat_page", "true")
+    form.add_field(
+        "photo_attach",
+        photo_bytes,
+        filename=filename,
+        content_type="image/jpeg",
+    )
+    timeout = aiohttp.ClientTimeout(total=180)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        async with s.post(
+            f"https://api.telegram.org/bot{bot.token}/postStory", data=form
+        ) as resp:
+            try:
+                payload = await resp.json()
+            except Exception:
+                payload = {"ok": False, "description": await resp.text()}
+            return payload
+
+
+async def handle_check_business_photo(
+    message: types.Message, db: Database, bot: Bot
+) -> None:
+    if message.from_user.id not in check_business_sessions:
+        return
+    if (message.text or "").strip().lower() == "/cancel":
+        check_business_sessions.pop(message.from_user.id, None)
+        await bot.send_message(message.chat.id, "Отменено.")
+        return
+    connection_hash = check_business_sessions.get(message.from_user.id, "")
+    if not connection_hash:
+        return
+
+    try:
+        cached = load_cached_business_connections()
+    except Exception:
+        logging.exception("check_business photo: failed to load business cache")
+        await bot.send_message(message.chat.id, "Не удалось прочитать кэш")
+        return
+    match = next(
+        (
+            item
+            for item in cached
+            if str(item.get("connection_hash") or "").strip() == connection_hash
+        ),
+        None,
+    )
+    if not match:
+        check_business_sessions.pop(message.from_user.id, None)
+        await bot.send_message(
+            message.chat.id,
+            "Подключение исчезло из кэша. Попроси партнёра переподключить бот.",
+        )
+        return
+    business_connection_id = str(match.get("connection_id") or "").strip()
+    if not business_connection_id:
+        check_business_sessions.pop(message.from_user.id, None)
+        await bot.send_message(message.chat.id, "В кэше нет business_connection_id")
+        return
+
+    images = await extract_images(message, bot)
+    if not images:
+        await bot.send_message(
+            message.chat.id,
+            "Не вижу картинки. Пришли фото или document с MIME image/*.",
+        )
+        return
+
+    photo_bytes, filename = images[0]
+    label = _check_business_label(match)
+    try:
+        result = await _post_business_story_photo(
+            bot=bot,
+            business_connection_id=business_connection_id,
+            photo_bytes=photo_bytes,
+            filename=filename or "story.jpg",
+        )
+    except Exception as exc:
+        logging.exception("check_business postStory raised connection_hash=%s", connection_hash)
+        await bot.send_message(
+            message.chat.id, f"Ошибка отправки: {exc}"
+        )
+        return
+
+    if not bool(result.get("ok")):
+        description = str(result.get("description") or "")
+        logging.warning(
+            "check_business postStory failed connection_hash=%s description=%s",
+            connection_hash,
+            description,
+        )
+        await bot.send_message(
+            message.chat.id,
+            f"Telegram отверг сторис для {label}: {description or 'unknown error'}",
+        )
+        return
+
+    check_business_sessions.pop(message.from_user.id, None)
+    story_id = (result.get("result") or {}).get("id")
+    logging.info(
+        "check_business postStory ok connection_hash=%s story_id=%s",
+        connection_hash,
+        story_id,
+    )
+    await bot.send_message(
+        message.chat.id,
+        f"✅ Сторис опубликована на {label} (story_id={story_id}, "
+        f"живёт {_CHECK_BUSINESS_ACTIVE_PERIOD // 3600} ч).",
+    )
 
 
 async def send_channels_list(

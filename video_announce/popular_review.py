@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from urllib.parse import urlparse
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.exc import OperationalError
 
 from handlers.popular_posts_cmd import _load_top_items, _resolve_telegraph_map
 from models import Event, VideoAnnounceItem, VideoAnnounceSession, VideoAnnounceSessionStatus
@@ -26,13 +28,20 @@ POPULAR_REVIEW_WINDOW_CHAIN: tuple[tuple[int, int, str], ...] = (
     (3, 2, "3d"),
     (7, 6, "7d"),
 )
-SUCCESSFUL_VIDEO_SESSION_STATUSES = {
-    VideoAnnounceSessionStatus.DONE,
+RECENT_PUBLISHED_VIDEO_SESSION_STATUSES = {
     VideoAnnounceSessionStatus.PUBLISHED_TEST,
     VideoAnnounceSessionStatus.PUBLISHED_MAIN,
 }
 
 POPULAR_REVIEW_RENDERABLE_IMAGE_LIMIT = 3
+REHYDRATED_PHOTO_PERSIST_LOCK_DELAYS_SEC: tuple[float, ...] = (
+    0.25,
+    0.5,
+    1.0,
+    2.0,
+    3.0,
+    5.0,
+)
 
 
 @dataclass(frozen=True)
@@ -102,6 +111,15 @@ def _renderable_photo_urls(urls: list[str]) -> list[str]:
         for url in urls
         if url and not _is_catbox_url(url)
     ][:POPULAR_REVIEW_RENDERABLE_IMAGE_LIMIT]
+
+
+def _is_sqlite_lock_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return (
+        "database is locked" in text
+        or "database table is locked" in text
+        or "database is busy" in text
+    )
 
 
 async def _rehydrate_public_tg_photo_urls(source_post_url: str | None) -> list[str]:
@@ -193,7 +211,54 @@ async def _rehydrate_vk_photo_urls(source_post_url: str | None) -> list[str]:
     return _renderable_photo_urls([str(url or "").strip() for url in photos])
 
 
-async def _ensure_renderable_photo_urls(ev: Event) -> list[str]:
+async def _persist_rehydrated_photo_urls(
+    db,
+    *,
+    event_id: int | None,
+    photo_urls: list[str],
+) -> bool:
+    if event_id is None or not photo_urls:
+        return False
+
+    last_lock_error: OperationalError | None = None
+    for attempt in range(len(REHYDRATED_PHOTO_PERSIST_LOCK_DELAYS_SEC) + 1):
+        try:
+            async with db.get_session() as session:
+                fresh = await session.get(Event, int(event_id))
+                if fresh is None:
+                    return False
+                fresh.photo_urls = list(photo_urls)
+                fresh.photo_count = len(photo_urls)
+                session.add(fresh)
+                await session.commit()
+            return True
+        except OperationalError as exc:
+            if not _is_sqlite_lock_error(exc):
+                raise
+            last_lock_error = exc
+            if attempt >= len(REHYDRATED_PHOTO_PERSIST_LOCK_DELAYS_SEC):
+                break
+            delay = REHYDRATED_PHOTO_PERSIST_LOCK_DELAYS_SEC[attempt]
+            logger.warning(
+                "video_announce.popular_review: sqlite locked while persisting rehydrated poster urls "
+                "event_id=%s attempt=%s retry_in=%.2fs",
+                event_id,
+                attempt + 1,
+                delay,
+            )
+            await asyncio.sleep(delay)
+
+    logger.warning(
+        "video_announce.popular_review: skipped rehydrated poster urls after sqlite lock retries "
+        "event_id=%s count=%s error=%s",
+        event_id,
+        len(photo_urls),
+        last_lock_error,
+    )
+    return False
+
+
+async def _ensure_renderable_photo_urls(ev: Event, *, db=None) -> list[str]:
     direct_urls = _renderable_photo_urls(_event_photo_urls(ev))
     if direct_urls:
         return direct_urls
@@ -218,6 +283,21 @@ async def _ensure_renderable_photo_urls(ev: Event) -> list[str]:
         if refreshed:
             ev.photo_urls = list(refreshed)
             ev.photo_count = len(refreshed)
+            if db is not None:
+                persisted = await _persist_rehydrated_photo_urls(
+                    db,
+                    event_id=getattr(ev, "id", None),
+                    photo_urls=refreshed,
+                )
+                if not persisted:
+                    logger.warning(
+                        "video_announce.popular_review: rehydrated poster urls are not durable; "
+                        "skipping event_id=%s source=%s count=%s",
+                        getattr(ev, "id", None),
+                        source_url,
+                        len(refreshed),
+                    )
+                    return []
             logger.info(
                 "video_announce.popular_review: rehydrated poster urls event_id=%s source=%s count=%s",
                 getattr(ev, "id", None),
@@ -255,27 +335,17 @@ async def _load_recent_popular_review_hits(
                 VideoAnnounceItem.session_id == VideoAnnounceSession.id,
             )
             .where(VideoAnnounceSession.profile_key == POPULAR_REVIEW_PROFILE)
-            .where(VideoAnnounceSession.status.in_(SUCCESSFUL_VIDEO_SESSION_STATUSES))
+            .where(VideoAnnounceSession.status.in_(RECENT_PUBLISHED_VIDEO_SESSION_STATUSES))
             .where(VideoAnnounceItem.event_id.is_not(None))
             .where(
-                VideoAnnounceSession.published_at.is_not(None),
-                VideoAnnounceSession.published_at >= threshold,
+                func.coalesce(
+                    VideoAnnounceSession.published_at,
+                    VideoAnnounceSession.finished_at,
+                    VideoAnnounceSession.started_at,
+                    VideoAnnounceSession.created_at,
+                )
+                >= threshold,
             )
-        )
-        published = {int(event_id) for event_id in result.scalars().all() if event_id is not None}
-        if published:
-            return published
-
-        result = await session.execute(
-            select(VideoAnnounceItem.event_id)
-            .join(
-                VideoAnnounceSession,
-                VideoAnnounceItem.session_id == VideoAnnounceSession.id,
-            )
-            .where(VideoAnnounceSession.profile_key == POPULAR_REVIEW_PROFILE)
-            .where(VideoAnnounceSession.status.in_(SUCCESSFUL_VIDEO_SESSION_STATUSES))
-            .where(VideoAnnounceItem.event_id.is_not(None))
-            .where(VideoAnnounceSession.created_at >= threshold)
         )
         return {int(event_id) for event_id in result.scalars().all() if event_id is not None}
 
@@ -360,15 +430,22 @@ async def build_popular_review_selection(
     )
 
     fresh: list[PopularReviewPick] = []
-    repeat_fill: list[PopularReviewPick] = []
     for hit in ordered_hits:
         event_id = int(hit["event_id"])
         event = events_map.get(event_id)
         if event is None:
             continue
+        if event_id in recent_hits:
+            logger.info(
+                "video_announce.popular_review: skipped event due to cooldown "
+                "event_id=%s anti_repeat_days=%s",
+                event_id,
+                anti_repeat_days,
+            )
+            continue
         if not _starts_today_or_in_future(event, today=today):
             continue
-        photo_urls = await _ensure_renderable_photo_urls(event)
+        photo_urls = await _ensure_renderable_photo_urls(event, db=db)
         if not photo_urls:
             logger.info(
                 "video_announce.popular_review: skipped event without renderable posters event_id=%s source=%s",
@@ -382,16 +459,13 @@ async def build_popular_review_selection(
             source_window=str(hit["source_window"]),
             source_post_url=str(hit["source_post_url"]),
             source_label=str(hit["source_label"]),
-            anti_repeat_status="repeat_fill" if event_id in recent_hits else "fresh",
+            anti_repeat_status="fresh",
             description=preferred_scene_description(event),
         )
-        if event_id in recent_hits:
-            repeat_fill.append(pick)
-        else:
-            fresh.append(pick)
+        fresh.append(pick)
 
     selected: list[PopularReviewPick] = []
-    for candidate in [*fresh, *repeat_fill]:
+    for candidate in fresh:
         if len(selected) >= max_events:
             break
         selected.append(candidate)

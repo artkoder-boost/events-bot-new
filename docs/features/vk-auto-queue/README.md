@@ -8,9 +8,11 @@
 2. Автоимпорт берёт элементы из `vk_inbox` и для каждого поста:
    - выбирает посты в строгой глобальной хронологии (oldest → newest) по `event_ts_hint/date/id` без bucket-randomization;
    - подтягивает текст/картинки (VK API `wall.getById`);
-   - извлекает 0..N событий (LLM Gemma, через `vk_intake.build_event_drafts`);
+   - извлекает 0..N событий (LLM Gemma, через `vk_intake.build_event_drafts`; для auto-import draft extraction по умолчанию `models/gemma-4-31b-it`);
    - на каждое извлечённое событие запускает `vk_intake.persist_event_and_pages` (внутри Smart Update);
    - пишет в лог источников факты (added/duplicate/conflict/note) и даёт оператору ссылки на Telegraph + `/log`.
+
+Gemma 4 migration note: VK auto-import draft extraction — это не бинарная предклассификация “есть событие / нет события”, а полноценное извлечение черновиков событий с датой, временем, площадкой, билетами и служебными полями перед Smart Update. Поэтому production default для этого scoped stage — `VK_AUTO_IMPORT_PARSE_GEMMA_MODEL=models/gemma-4-31b-it`; более маленькая `26b` допустима только как явный canary override. Smart Update routing и глобальный `/parse` этим переключателем не меняются.
 
 Иллюстрации для extracted events проходят через общий server-side `upload_images()` path:
 
@@ -164,6 +166,7 @@ ENV:
 - `VK_AUTO_IMPORT_TIMES_LOCAL` (по умолчанию `06:30,18:30`) локальные времена запуска.
 - `VK_AUTO_IMPORT_TZ` (по умолчанию `Europe/Kaliningrad`) таймзона расписания.
 - `VK_AUTO_IMPORT_LIMIT` (по умолчанию `15`) сколько постов обработать за один запуск.
+- `VK_AUTO_IMPORT_PARSE_GEMMA_MODEL` (по умолчанию `models/gemma-4-31b-it`) scoped model override только для VK auto-import draft extraction. Он передаётся в `event_parse` через `vk_intake`, но не меняет Smart Update и не меняет глобальный `/parse`.
 - `VK_AUTO_IMPORT_PREFETCH` (по умолчанию `0`) включает конвейер N/N+1: пока сохраняется пост N, параллельно подтягиваем лёгкие данные поста N+1 (wall.getById + мета). При `0` очередь держит только текущий row locked и берёт следующий post уже после завершения текущего, что безопаснее для startup recovery.
 - `VK_AUTO_IMPORT_PREFETCH_DRAFTS` (по умолчанию `0`) если включён — в префетче дополнительно выполняется (download media + OCR + LLM-parse) для N+1. ⚠️ Может заметно увеличить RAM и привести к OOM на маленьких машинах (например Fly `512MB`).
 - `VK_AUTO_IMPORT_MAX_PHOTOS` (по умолчанию `4`) ограничивает число VK-афиш/фото, которые auto-import подтягивает в live row для OCR/upload/LLM. Это отдельный guardrail для production RAM и не меняет глобальный `MAX_ALBUM_IMAGES` для других путей.
@@ -189,6 +192,7 @@ Recovery: legacy-строки `vk_inbox.status='importing'`, зависшие д
 - scheduler entrypoint теперь создаёт bootstrap `ops_run` ещё до резолва superadmin/limit, а сам `run_vk_auto_import()` переиспользует эту же запись; поэтому ложный outer fire APScheduler без реального разбора очереди больше не должен исчезать бесследно;
 - если entrypoint или делегированный run падают до нормального summary, bootstrap-запись закрывается как `status='error'` с `fatal_error` в `details_json`;
 - `/general_stats` показывает такие записи в блоке `vk_auto_import runs`, чтобы было видно разницу между “очередь была пустой”, “run реально выполнился” и “scheduler попытался, но пропустил запуск”.
+- `persist_skipped ... skipped_festival_post` / `skipped_non_event:online_event` в `ops_run.details_json` считаются regression-сигналами, если исходный VK-пост описывает один конкретный офлайн event. Примеры guardrail: одиночный мастер-класс внутри цикла/программы не должен уходить в фестивальную очередь как whole-festival post, а «онлайн-регистрация» не делает офлайн велопробег онлайн-only событием.
 Важно: обработка событий остаётся последовательной и сериализована через `HEAVY_SEMAPHORE` и внутренний lock Smart Update. По умолчанию очередь идёт строго row-by-row без N+1 reserve; если `VK_AUTO_IMPORT_PREFETCH=1`, включается лёгкий prefetch следующего post, а полный (media/OCR/LLM) префетч по-прежнему включается только через `VK_AUTO_IMPORT_PREFETCH_DRAFTS=1`.
 
 Если `VK_AUTO_IMPORT_INLINE_JOBS=1`, то `persist_event_and_pages()` больше не ждёт отдельно появления `telegraph_url` до 10 секунд: очередь всё равно сразу запускает inline `telegraph_build`, поэтому двойное ожидание убрано без потери качества/полноты отчёта.

@@ -91,6 +91,7 @@ class GoogleAIClient:
     # Default values
     DEFAULT_MAX_OUTPUT_TOKENS = 8192
     DEFAULT_TPM_RESERVE_EXTRA = 1000
+    DEFAULT_MULTIMODAL_IMAGE_TOKENS = 1600
     # Heuristic budget for prompt token estimation. We intentionally overestimate
     # to avoid passing Supabase reserve checks and then hitting provider 429
     # on input-token-per-minute quotas.
@@ -116,6 +117,7 @@ class GoogleAIClient:
     RESERVE_DIRECT_RETRY_ENV = "GOOGLE_AI_RESERVE_DIRECT_RETRY"
     RESERVE_DIRECT_SCHEMA_ENV = "GOOGLE_AI_RESERVE_DIRECT_SCHEMA"
     RESERVE_SCOPE_TO_DEFAULT_ENV_ENV = "GOOGLE_AI_RESERVE_SCOPE_TO_DEFAULT_ENV"
+    PROVIDER_TIMEOUT_ENV = "GOOGLE_AI_PROVIDER_TIMEOUT_SEC"
 
     # Process-local limiter (used when Supabase reserve RPC is missing/flaky).
     _local_limiter_lock = asyncio.Lock()
@@ -237,6 +239,7 @@ class GoogleAIClient:
         self.max_retries = self._read_int_env("GOOGLE_AI_MAX_RETRIES", self.MAX_RETRIES)
         self.retry_delays_ms = self._read_retry_delays()
         self.fallback_models = self._read_fallback_models()
+        self.provider_timeout_seconds = self._read_float_env(self.PROVIDER_TIMEOUT_ENV, 0.0)
         self._incident_last_sent: dict[str, float] = {}
         self.scope_reserve_to_default_env = (
             os.getenv(self.RESERVE_SCOPE_TO_DEFAULT_ENV_ENV, "1").strip().lower()
@@ -266,6 +269,16 @@ class GoogleAIClient:
         except Exception:
             return default
 
+    @staticmethod
+    def _read_float_env(name: str, default: float) -> float:
+        raw = (os.getenv(name) or "").strip()
+        if not raw:
+            return default
+        try:
+            return max(0.0, float(raw))
+        except Exception:
+            return default
+
     def _read_retry_delays(self) -> list[int]:
         raw = (os.getenv("GOOGLE_AI_RETRY_DELAYS_MS") or "").strip()
         if not raw:
@@ -287,10 +300,14 @@ class GoogleAIClient:
         if not raw:
             return []
         names = [raw]
-        if raw == "GOOGLE_API_KEY2":
-            names.append("GOOGLE_API_KEY_2")
-        elif raw == "GOOGLE_API_KEY_2":
-            names.append("GOOGLE_API_KEY2")
+        match = re.match(r"^(GOOGLE_API_KEY)_?(\d+)$", raw)
+        if match:
+            prefix, suffix = match.groups()
+            compact = f"{prefix}{suffix}"
+            underscored = f"{prefix}_{suffix}"
+            for alias in (compact, underscored):
+                if alias not in names:
+                    names.append(alias)
         return names
 
     def _resolve_default_env_candidate_key_ids(
@@ -306,7 +323,9 @@ class GoogleAIClient:
         cache_key = (consumer, env_names)
         if cache_key in _DEFAULT_ENV_CANDIDATE_CACHE:
             cached = _DEFAULT_ENV_CANDIDATE_CACHE[cache_key]
-            return list(cached) if cached else None
+            if cached is None:
+                return None
+            return list(cached)
         try:
             result = (
                 self.supabase.table("google_ai_api_keys")
@@ -338,8 +357,8 @@ class GoogleAIClient:
                 consumer,
                 ",".join(env_names),
             )
-            _DEFAULT_ENV_CANDIDATE_CACHE[cache_key] = None
-            return None
+            _DEFAULT_ENV_CANDIDATE_CACHE[cache_key] = ()
+            return []
         _DEFAULT_ENV_CANDIDATE_CACHE[cache_key] = ids
         return list(ids)
 
@@ -514,7 +533,7 @@ class GoogleAIClient:
     async def generate_content_async(
         self,
         model: str,
-        prompt: str,
+        prompt: Any,
         generation_config: Optional[dict] = None,
         safety_settings: Optional[list] = None,
         max_output_tokens: Optional[int] = None,
@@ -524,7 +543,7 @@ class GoogleAIClient:
         
         Args:
             model: Model name (e.g., "gemma-3-27b")
-            prompt: Input prompt
+            prompt: Input prompt or multimodal content parts
             generation_config: Optional generation config
             safety_settings: Optional safety settings
             max_output_tokens: Max output tokens (for TPM reservation)
@@ -650,7 +669,7 @@ class GoogleAIClient:
         self,
         ctx: RequestContext,
         attempt_no: int,
-        prompt: str,
+        prompt: Any,
         generation_config: Optional[dict],
         safety_settings: Optional[list],
         max_output_tokens: Optional[int],
@@ -694,7 +713,8 @@ class GoogleAIClient:
         try:
             if self.dry_run:
                 # Dry run mode for testing
-                response_text = f"[DRY RUN] Response for: {prompt[:50]}..."
+                prompt_preview = self._prompt_text_for_estimate(prompt)[:50]
+                response_text = f"[DRY RUN] Response for: {prompt_preview}..."
                 usage = UsageInfo(input_tokens=100, output_tokens=50, total_tokens=150)
             else:
                 response_text, usage = await self._call_provider(
@@ -815,6 +835,26 @@ class GoogleAIClient:
         if scoped_candidate_key_ids is None:
             scoped_candidate_key_ids = self._resolve_default_env_candidate_key_ids(
                 consumer=ctx.consumer,
+            )
+        if scoped_candidate_key_ids == []:
+            logger.warning(
+                "google_ai.reserve_default_env_candidates_missing_fallback "
+                "consumer=%s env=%s",
+                ctx.consumer,
+                self.default_env_var_name,
+            )
+            if self.allow_local_limiter_fallback:
+                return await self._local_reserve(
+                    ctx,
+                    attempt_no=attempt_no,
+                    key_alias="local-fallback-default-env-missing",
+                    blocked_reason="default_env_candidates_missing",
+                )
+            return ReserveResult(
+                ok=True,
+                env_var_name=self.default_env_var_name,
+                key_alias="reserve-fallback-default-env-missing",
+                blocked_reason="default_env_candidates_missing",
             )
 
         payload = {
@@ -1317,7 +1357,7 @@ class GoogleAIClient:
         self,
         api_key: str,
         model: str,
-        prompt: str,
+        prompt: Any,
         generation_config: Optional[dict],
         safety_settings: Optional[list],
         max_output_tokens: Optional[int],
@@ -1362,11 +1402,23 @@ class GoogleAIClient:
         gen_model = self.genai.GenerativeModel(model_name)
         
         # Generate content
-        response = await gen_model.generate_content_async(
+        provider_call = gen_model.generate_content_async(
             prompt,
             generation_config=config,
             safety_settings=safety_settings,
         )
+        if self.provider_timeout_seconds > 0:
+            try:
+                response = await asyncio.wait_for(
+                    provider_call,
+                    timeout=self.provider_timeout_seconds,
+                )
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError(
+                    f"Google AI provider call timed out after {self.provider_timeout_seconds:.1f}s"
+                ) from exc
+        else:
+            response = await provider_call
         
         def _get_usage(resp: Any) -> UsageInfo:
             usage = UsageInfo()
@@ -1452,13 +1504,66 @@ class GoogleAIClient:
     def _get_api_key(self, env_var_name: Optional[str]) -> Optional[str]:
         """Get API key from environment or secrets provider."""
         name = env_var_name or self.default_env_var_name or "GOOGLE_API_KEY"
-        
+
+        aliases = self._default_env_aliases(name) or [name]
         if self.secrets_provider:
-            return self.secrets_provider.get_secret(name)
-        
-        return os.getenv(name)
-    
-    def _estimate_prompt_tokens(self, prompt: str) -> int:
+            for alias in aliases:
+                value = self.secrets_provider.get_secret(alias)
+                if value:
+                    return value
+
+        for alias in aliases:
+            value = os.getenv(alias)
+            if value:
+                return value
+        return None
+
+    def _prompt_estimate_components(self, prompt: Any) -> tuple[str, int]:
+        if isinstance(prompt, str):
+            return prompt, 0
+        if isinstance(prompt, (list, tuple)):
+            text_parts: list[str] = []
+            blob_count = 0
+            for item in prompt:
+                extracted, item_blob_count = self._prompt_estimate_components(item)
+                if extracted:
+                    text_parts.append(extracted)
+                blob_count += item_blob_count
+            return "\n".join(text_parts), blob_count
+        if isinstance(prompt, dict):
+            text_parts: list[str] = []
+            blob_count = 0
+            parts_value = prompt.get("parts")
+            if isinstance(parts_value, (list, tuple)):
+                extracted, nested_blob_count = self._prompt_estimate_components(parts_value)
+                if extracted:
+                    text_parts.append(extracted)
+                blob_count += nested_blob_count
+            for key in ("text", "prompt", "content"):
+                value = prompt.get(key)
+                if isinstance(value, str):
+                    if value.strip():
+                        text_parts.append(value.strip())
+                    continue
+                if isinstance(value, (list, tuple)):
+                    extracted, nested_blob_count = self._prompt_estimate_components(value)
+                    if extracted:
+                        text_parts.append(extracted)
+                    blob_count += nested_blob_count
+            if "inline_data" in prompt or (
+                isinstance(prompt.get("mime_type"), str) and prompt.get("data") is not None
+            ):
+                blob_count += 1
+            if text_parts:
+                return "\n".join(text_parts), blob_count
+            return "", blob_count
+        return str(prompt or ""), 0
+
+    def _prompt_text_for_estimate(self, prompt: Any) -> str:
+        text, _blob_count = self._prompt_estimate_components(prompt)
+        return text
+
+    def _estimate_prompt_tokens(self, prompt: Any) -> int:
         """Best-effort token estimate for prompts.
 
         We can't depend on provider-side countTokens here (it would also require
@@ -1466,14 +1571,15 @@ class GoogleAIClient:
         Cyrillic/OCR prompts can tokenize much denser than a simple bytes/4
         estimate and otherwise slip past reserve() only to hit provider 429.
         """
-        if not prompt:
+        prompt_text, blob_count = self._prompt_estimate_components(prompt)
+        if not prompt_text and blob_count <= 0:
             return 1
         try:
-            size = len(prompt.encode("utf-8", errors="ignore"))
+            size = len(prompt_text.encode("utf-8", errors="ignore"))
         except Exception:
-            size = len(prompt)
-        chars = len(prompt)
-        non_ascii = sum(1 for ch in prompt if ord(ch) > 127)
+            size = len(prompt_text)
+        chars = len(prompt_text)
+        non_ascii = sum(1 for ch in prompt_text if ord(ch) > 127)
         non_ascii_ratio = (non_ascii / chars) if chars > 0 else 0.0
 
         bytes_est = size / float(self._BYTES_PER_TOKEN_ESTIMATE)
@@ -1486,9 +1592,11 @@ class GoogleAIClient:
         est = int(max(bytes_est, chars_est))
         # Add overhead for JSON, escaping, and tokenization variance.
         est = int(est * 1.15) + 50
+        if blob_count > 0:
+            est += blob_count * int(self.DEFAULT_MULTIMODAL_IMAGE_TOKENS)
         return max(1, est)
 
-    def _calculate_reserved_tpm(self, *, prompt: str, max_output_tokens: int) -> int:
+    def _calculate_reserved_tpm(self, *, prompt: Any, max_output_tokens: int) -> int:
         """Calculate tokens to reserve for TPM check.
 
         Supabase reservation must cover BOTH prompt (input) and output tokens.

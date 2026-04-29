@@ -17,6 +17,8 @@
     *   *Примечание:* Сами ключи хранятся в ENV, а Supabase возвращает имя переменной окружения для выбранного ключа.
 *   **Supabase RPC (`google_ai_reserve`)**: Атомарное резервирование лимитов. Возвращает `env_var_name` (какую переменную среды читать).
     *   По умолчанию reserve теперь **scope-ится к `default_env_var_name` клиента**: если вызывающий consumer не передал явные `candidate_key_ids`, клиент сначала резолвит metadata только для своего ENV-ключа (`GOOGLE_API_KEY` для обычных bot-потоков, `GOOGLE_API_KEY2` для guide-only runtimes). Это защищает общие пайплайны от случайного “перетекания” на чужой ключ только потому, что в `google_ai_api_keys` появилась новая активная строка.
+    *   Если metadata для scoped ENV-ключа отсутствует в Supabase registry (например `GOOGLE_API_KEY3` в Telegram Monitoring canary), клиент **не** снимает scope и не берёт общий key pool. Он переходит на process-local limiter fallback с тем же `default_env_var_name`, чтобы provider call всё равно шёл через выбранный runtime key.
+    *   Empty scoped-key cache is sticky: an empty result is cached as `[]` and remains local-limiter fallback on later calls in the same process, instead of widening back to an unscoped reserve.
 *   **Supabase RPC (`google_ai_mark_sent`)**: Помечает, что запрос реально отправлен провайдеру (для диагностики/восстановления).
 *   **Supabase RPC (`google_ai_finalize`)**: Фиксирует фактическое потребление токенов и статус провайдера.
 *   **Reserve fallback (защита от “вечного fallback в Smart Update”)**:
@@ -33,6 +35,9 @@
     * это изменение только в коде клиента, без изменения RPC/таблиц в проде.
 *   **Stale reservation recovery:**
     * transient RPC errors на `google_ai_mark_sent` / `google_ai_finalize` теперь имеют короткие retry (тот же backoff-профиль, что и reserve RPC);
+*   **Provider timeout guard:**
+    * `GOOGLE_AI_PROVIDER_TIMEOUT_SEC` (default `0`, disabled unless set by a caller) wraps the underlying Google AI provider call with `asyncio.wait_for`;
+    * timed-out calls are finalized as failed attempts and surfaced as `TimeoutError`, so feature-level code can fail-open or opt into its own retry policy without waiting for provider-side 10-minute deadlines.
     * для уже накопившихся записей доступен RPC `google_ai_sweep_stale(p_older_than_minutes, p_limit)`, который компенсирует counters только для безопасного окна `status='reserved' AND sent_at IS NULL`, затем помечает записи как `stale`;
     * ручной запуск из репозитория: `python scripts/inspect/sweep_google_ai_stale.py --use-service --older-than-minutes 30 --limit 500`.
 
@@ -107,6 +112,7 @@ python scripts/inspect/probe_supabase_rpc.py google_ai_finalize --schema public
 
 *   `Gemma 3` / старые Gemma-path по-прежнему fail-open работают через prompt-only JSON contract: `response_mime_type` / `response_schema` снимаются на клиенте, потому что эти модели часто отвергали native JSON knobs.
 *   `Gemma 4` (`gemma-4-31b`, `gemma-4-26b-a4b`) теперь сохраняет native `response_mime_type=application/json` и `response_schema`, если вызывающий stage их передал. Это нужно для structured extract / classify / dedup stages, где `lollipop g4` уже показал реальный practical uplift именно от native schema discipline.
+*   `generate_content_async()` теперь принимает не только plain string, но и multimodal prompt parts (`text` + `inline_data` blobs). Это позволяет guide/Telegram Kaggle runtimes использовать общий gateway и для image+text OCR/vision paths, а не обходить лимитер отдельным direct SDK-вызовом.
 
 Дополнительное правило transport hygiene:
 
@@ -115,6 +121,7 @@ python scripts/inspect/probe_supabase_rpc.py google_ai_finalize --schema public
 ### 2.2. Алгоритм работы
 1.  **Reserve**: Клиент запрашивает резерв (примерно `max_output_tokens + 1000`).
     *   Для длинных текстовых prompt’ов используется консервативная оценка по байтам **и** символам; это особенно важно для русскоязычных/OCR-heavy запросов, где простой `bytes/4` может занизить реальный input TPM.
+    *   Для multimodal prompt parts текст оценивается отдельно от binary blobs, а каждый image/blob получает дополнительный safety reserve, чтобы raw bytes не раздували estimate строковым `repr`, но image-heavy OCR calls всё равно не уходили в систематическое under-reserve.
     *   *Успех:* Получает `api_key` и разрешение.
     *   *Отказ:* Получает `RateLimitError` (Fail Fast, NO_WAIT).
 2.  **Execute**: Вызов API провайдера (Google AI Studio).

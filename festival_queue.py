@@ -286,6 +286,7 @@ def detect_festival_context(
     day_signal = bool(_DAY_SERIES_RE.search(joined_text))
     range_signal = bool(_DATE_RANGE_RE.search(joined_text))
     multi_signal = bool(range_signal or date_count >= 2 or time_count >= 2 or list_lines >= 3)
+    multi_schedule_signal = bool(range_signal or date_count >= 2 or time_count >= 2)
     # If extractor already provided a multi-day range, treat it as a strong festival signal.
     for ev in events:
         date_value = str(ev.get("date") or "").strip()
@@ -296,9 +297,12 @@ def detect_festival_context(
             break
 
     strong_events = 0
+    event_type_festival = False
     for ev in events:
         if not isinstance(ev, dict):
             continue
+        if str(ev.get("event_type") or "").strip().lower() == "festival":
+            event_type_festival = True
         title = str(ev.get("title") or "").strip()
         date_value = str(ev.get("date") or "").strip()
         location = str(ev.get("location_name") or "").strip()
@@ -310,7 +314,13 @@ def detect_festival_context(
 
     context: FestivalContext = "none"
     if explicit_context == "festival_post":
-        context = "festival_post"
+        # LLM/parser outputs sometimes over-label a single concrete event
+        # inside a cycle/festival as a whole festival program. Keep only true
+        # program-like posts in the queue; let a lone event enter Smart Update.
+        if strong_events == 1 and not multi_schedule_signal and not day_signal and not event_type_festival:
+            context = "event_with_festival" if festival else "none"
+        else:
+            context = "festival_post"
     elif explicit_context == "event_with_festival":
         context = "event_with_festival"
     elif (has_festival_flag and festival) or (
@@ -326,13 +336,13 @@ def detect_festival_context(
         context = "festival_post"
     elif day_signal and (multi_signal or list_lines >= 2):
         context = "festival_post"
-    elif (program_signal and multi_signal and (festival or source_is_festival)):
+    elif (program_signal and multi_signal and (festival or source_is_festival) and strong_events != 1):
         context = "festival_post"
     elif not events and festival:
         context = "festival_post"
     elif festival and strong_events > 0:
         context = "event_with_festival"
-    elif source_is_festival and (program_signal or day_signal):
+    elif source_is_festival and (program_signal or day_signal) and strong_events != 1:
         context = "festival_post"
 
     if context == "festival_post" and not festival and source_series:

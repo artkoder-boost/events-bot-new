@@ -10,6 +10,7 @@ import tempfile
 import time
 import uuid
 import contextlib
+import shutil
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -215,6 +216,8 @@ async def _tg_monitor_global_lock(
 
 KERNEL_REF = os.getenv("TG_MONITORING_KERNEL_REF", "artkoder/telegram-monitor-bot")
 KERNEL_PATH = Path(os.getenv("TG_MONITORING_KERNEL_PATH", "kaggle/TelegramMonitor"))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+GOOGLE_AI_PACKAGE_PATH = PROJECT_ROOT / "google_ai"
 
 DATASET_PROPAGATION_WAIT_SECONDS = int(os.getenv("TG_MONITORING_DATASET_WAIT", "30"))
 POLL_INTERVAL_SECONDS = int(os.getenv("TG_MONITORING_POLL_INTERVAL", "30"))
@@ -468,11 +471,24 @@ def _build_secrets_payload() -> str:
             bundle_ok = True
         except Exception as exc:  # pragma: no cover - validation only
             logger.warning("tg_monitor.secrets_payload invalid bundle: %s", exc)
+    google_key_env = (_get_env_value("TG_MONITORING_GOOGLE_KEY_ENV") or "GOOGLE_API_KEY3").strip() or "GOOGLE_API_KEY3"
+    google_fallback_env = (
+        _get_env_value("TG_MONITORING_GOOGLE_FALLBACK_KEY_ENV") or google_key_env
+    ).strip() or google_key_env
+    google_key_value = _require_env(google_key_env)
     payload = {
         "TG_API_ID": _require_env("TG_API_ID"),
         "TG_API_HASH": _require_env("TG_API_HASH"),
-        "GOOGLE_API_KEY": _require_env("GOOGLE_API_KEY"),
+        # Keep the legacy GOOGLE_API_KEY alias pointed at the selected Telegram
+        # monitoring key so accidental unscoped provider access cannot borrow
+        # the bot/guide pools.
+        "GOOGLE_API_KEY": google_key_value,
+        google_key_env: google_key_value,
+        "TG_MONITORING_GOOGLE_KEY_ENV": google_key_env,
+        "TG_MONITORING_GOOGLE_FALLBACK_KEY_ENV": google_fallback_env,
     }
+    if google_fallback_env != google_key_env:
+        payload[google_fallback_env] = _require_env(google_fallback_env)
     logger.info(
         "tg_monitor.secrets_payload bundle_env=%s bundle_len=%s bundle_ok=%s tg_session=%s days_back=%s limit=%s",
         bundle_env_key or "-",
@@ -492,10 +508,8 @@ def _build_secrets_payload() -> str:
     else:
         payload["TG_SESSION"] = _require_env("TG_SESSION")
         payload["TG_MONITORING_ALLOW_TG_SESSION"] = "1"
-    # Include any additional Google API keys for pooled rate limiting.
-    for key, value in os.environ.items():
-        if key.startswith("GOOGLE_API_KEY") and key not in payload and value:
-            payload[key] = value
+    # Do not ship unrelated GOOGLE_API_KEY* values into the Telegram monitoring
+    # Kaggle runtime. This surface is isolated to GOOGLE_API_KEY3.
     # Pass storage credentials to Kaggle runtime.
     for key in (
         "SUPABASE_URL",
@@ -517,7 +531,7 @@ def _build_secrets_payload() -> str:
             continue
         if key.startswith(("TG_MONITORING_", "TG_GEMMA_")):
             payload[key] = value
-        elif key == "GOOGLE_API_LOCALNAME":
+        elif key.startswith("GOOGLE_API_LOCALNAME"):
             payload[key] = value
     return json.dumps(payload, ensure_ascii=False)
 
@@ -671,16 +685,176 @@ def _kernel_ref_from_meta(kernel_path: Path) -> str:
         return KERNEL_REF
 
 
+def _stage_google_ai_bundle(output_root: Path) -> Path:
+    if not GOOGLE_AI_PACKAGE_PATH.exists():
+        raise FileNotFoundError(f"Missing package: {GOOGLE_AI_PACKAGE_PATH}")
+    shutil.copytree(GOOGLE_AI_PACKAGE_PATH, output_root / "google_ai")
+    return output_root
+
+
+def _embedded_google_ai_sources() -> dict[str, str]:
+    files = ("__init__.py", "client.py", "exceptions.py", "secrets.py")
+    payload: dict[str, str] = {}
+    for name in files:
+        path = GOOGLE_AI_PACKAGE_PATH / name
+        if not path.exists():
+            raise FileNotFoundError(f"Missing google_ai source for notebook embed: {path}")
+        payload[name] = path.read_text(encoding="utf-8")
+    return payload
+
+
+def _build_notebook_payload_from_script(script_path: Path) -> dict[str, Any]:
+    script_source = script_path.read_text(encoding="utf-8")
+    script_source = re.sub(
+        r"\ntry:\n\s+_loop = asyncio\.get_running_loop\(\)\nexcept RuntimeError:\n\s+asyncio\.run\(main\(\)\)\nelse:\n\s+raise RuntimeError\([^\n]+\)\n?$",
+        "\n",
+        script_source,
+        flags=re.MULTILINE,
+    )
+    script_lines = script_source.splitlines(keepends=True)
+    embedded_google_ai = json.dumps(_embedded_google_ai_sources(), ensure_ascii=False)
+    future_import_lines: list[str] = []
+    while script_lines and script_lines[0].startswith("from __future__ import "):
+        future_import_lines.append(script_lines.pop(0))
+    if script_lines and not script_lines[0].strip():
+        future_import_lines.append(script_lines.pop(0))
+    source_lines = list(future_import_lines)
+    source_lines.extend(
+        [
+            "from pathlib import Path as _TgNotebookPath\n",
+            "import sys as _TgNotebookSys\n",
+            "_TG_EMBEDDED_GOOGLE_AI = " + embedded_google_ai + "\n",
+            "_TG_EMBEDDED_ROOT = (_TgNotebookPath.cwd() / 'embedded_repo_bundle').resolve()\n",
+            "_TG_EMBEDDED_PACKAGE = _TG_EMBEDDED_ROOT / 'google_ai'\n",
+            "_TG_EMBEDDED_PACKAGE.mkdir(parents=True, exist_ok=True)\n",
+            "for _tg_name, _tg_body in _TG_EMBEDDED_GOOGLE_AI.items():\n",
+            "    (_TG_EMBEDDED_PACKAGE / _tg_name).write_text(_tg_body, encoding='utf-8')\n",
+            "if str(_TG_EMBEDDED_ROOT) not in _TgNotebookSys.path:\n",
+            "    _TgNotebookSys.path.insert(0, str(_TG_EMBEDDED_ROOT))\n",
+            "_TG_NOTEBOOK_ROOT = _TgNotebookPath.cwd().resolve()\n",
+            "if str(_TG_NOTEBOOK_ROOT) not in _TgNotebookSys.path:\n",
+            "    _TgNotebookSys.path.insert(0, str(_TG_NOTEBOOK_ROOT))\n",
+            "__file__ = str((_TG_NOTEBOOK_ROOT / 'telegram_monitor.py').resolve())\n",
+            "\n",
+        ]
+    )
+    source_lines.extend(script_lines)
+    if source_lines and not source_lines[-1].endswith("\n"):
+        source_lines[-1] = f"{source_lines[-1]}\n"
+    return {
+        "cells": [
+            {
+                "cell_type": "markdown",
+                "metadata": {},
+                "source": [
+                    "# Telegram Monitor\n",
+                    "\n",
+                    "Kaggle notebook for scanning Telegram sources and exporting `telegram_results.json`.\n",
+                ],
+            },
+            {
+                "cell_type": "code",
+                "execution_count": None,
+                "metadata": {},
+                "outputs": [],
+                "source": source_lines,
+            },
+            {
+                "cell_type": "code",
+                "execution_count": None,
+                "metadata": {},
+                "outputs": [],
+                "source": [
+                    "import asyncio\n",
+                    "import nest_asyncio\n",
+                    "\n",
+                    "def _tg_run_main_sync() -> None:\n",
+                    "    try:\n",
+                    "        loop = asyncio.get_event_loop()\n",
+                    "    except RuntimeError:\n",
+                    "        loop = asyncio.new_event_loop()\n",
+                    "        asyncio.set_event_loop(loop)\n",
+                    "    if loop.is_closed():\n",
+                    "        loop = asyncio.new_event_loop()\n",
+                    "        asyncio.set_event_loop(loop)\n",
+                    "    if loop.is_running():\n",
+                    "        nest_asyncio.apply(loop)\n",
+                    "    loop.run_until_complete(main())\n",
+                    "\n",
+                    "_tg_run_main_sync()\n",
+                ],
+            },
+        ],
+        "metadata": {
+            "kernelspec": {
+                "display_name": "Python 3",
+                "language": "python",
+                "name": "python3",
+            },
+            "language_info": {
+                "codemirror_mode": {"name": "ipython", "version": 3},
+                "file_extension": ".py",
+                "mimetype": "text/x-python",
+                "name": "python",
+                "nbconvert_exporter": "python",
+                "pygments_lexer": "ipython3",
+                "version": "3.12",
+            },
+        },
+        "nbformat": 4,
+        "nbformat_minor": 4,
+    }
+
+
+def _sync_notebook_entrypoint(kernel_path: Path) -> None:
+    meta_path = kernel_path / "kernel-metadata.json"
+    if not meta_path.exists():
+        return
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    code_file = str(meta.get("code_file") or "").strip()
+    if not code_file.endswith(".ipynb"):
+        return
+    notebook_path = kernel_path / code_file
+    script_path = kernel_path / f"{Path(code_file).stem}.py"
+    if not script_path.exists():
+        raise FileNotFoundError(
+            f"Telegram Monitoring Kaggle runner script missing for notebook build: {script_path}"
+        )
+    notebook = _build_notebook_payload_from_script(script_path)
+    notebook_path.write_text(
+        json.dumps(notebook, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+@contextlib.contextmanager
+def _prepared_kernel_path(kernel_path: Path) -> Path:
+    if not _kernel_has_code(kernel_path):
+        raise RuntimeError(f"Telegram Monitoring kernel code missing: {kernel_path}")
+    with tempfile.TemporaryDirectory(prefix="tg-monitor-kernel-") as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        prepared = tmp_path / kernel_path.name
+        shutil.copytree(kernel_path, prepared)
+        _stage_google_ai_bundle(prepared)
+        _sync_notebook_entrypoint(prepared)
+        yield prepared
+
+
 async def _push_kernel(
     client: KaggleClient,
     dataset_sources: list[str],
 ) -> str:
-    kernel_ref = _kernel_ref_from_meta(KERNEL_PATH)
     if _kernel_has_code(KERNEL_PATH):
-        logger.info("tg_monitor: pushing local kernel %s", KERNEL_PATH)
-        client.push_kernel(kernel_path=KERNEL_PATH, dataset_sources=dataset_sources)
-        return kernel_ref
+        with _prepared_kernel_path(KERNEL_PATH) as prepared_path:
+            kernel_ref = _kernel_ref_from_meta(prepared_path)
+            logger.info("tg_monitor: pushing local kernel %s", prepared_path)
+            client.push_kernel(kernel_path=prepared_path, dataset_sources=dataset_sources)
+            return kernel_ref
     logger.info("tg_monitor: local kernel code missing, deploying remote kernel")
+    kernel_ref = _kernel_ref_from_meta(KERNEL_PATH)
     for slug in dataset_sources:
         kernel_ref = client.deploy_kernel_update(kernel_ref, slug)
     return kernel_ref

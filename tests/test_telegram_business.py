@@ -1,0 +1,150 @@
+import json
+from datetime import datetime, timezone
+
+from telegram_business import (
+    WEBHOOK_ALLOWED_UPDATES,
+    business_connection_summary,
+    cache_business_connection,
+    load_business_story_targets,
+    load_cached_business_connections,
+)
+
+
+class Obj:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+def test_webhook_allowed_updates_include_business_connection():
+    assert "business_connection" in WEBHOOK_ALLOWED_UPDATES
+    assert WEBHOOK_ALLOWED_UPDATES.count("business_connection") == 1
+    assert "business_message" in WEBHOOK_ALLOWED_UPDATES
+    assert "edited_business_message" in WEBHOOK_ALLOWED_UPDATES
+
+
+def test_business_connection_cache_encrypts_sensitive_ids(tmp_path, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "7910015203:test-token")
+    connection = Obj(
+        id="biz-connection-secret",
+        user=Obj(id=123456789, username="story_owner_fixture"),
+        user_chat_id=987654321,
+        date=1777194243,
+        is_enabled=True,
+        rights=Obj(can_manage_stories=True),
+        can_reply=True,
+    )
+
+    target = tmp_path / "connections.enc.json"
+    record = cache_business_connection(connection, path=target)
+
+    raw = target.read_text(encoding="utf-8")
+    payload = json.loads(raw)
+    assert payload["connections"]
+    assert "biz-connection-secret" not in raw
+    assert "123456789" not in raw
+    assert "story_owner_fixture" not in raw
+    assert record["can_manage_stories"] is True
+    assert business_connection_summary(connection)["connection_hash"]
+
+    restored = load_cached_business_connections(path=target)
+    assert restored[0]["connection_id"] == "biz-connection-secret"
+    assert restored[0]["user_id"] == 123456789
+    assert restored[0]["username"] == "story_owner_fixture"
+
+
+def test_business_story_targets_select_all_story_capable_connections(tmp_path, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "7910015203:test-token")
+    monkeypatch.setenv("VIDEO_ANNOUNCE_STORY_BUSINESS_TARGETS", "all")
+    target = tmp_path / "connections.enc.json"
+    cache_business_connection(
+        Obj(
+            id="biz-connection-secret",
+            user=Obj(id=123456789, username="story_owner_fixture"),
+            user_chat_id=987654321,
+            date=1777194243,
+            is_enabled=True,
+            rights=Obj(can_manage_stories=True),
+        ),
+        path=target,
+    )
+
+    targets = load_business_story_targets(path=target)
+
+    assert len(targets) == 1
+    assert targets[0]["connection_id"] == "biz-connection-secret"
+    assert targets[0]["connection_hash"]
+    assert "story_owner_fixture" not in json.dumps(targets, ensure_ascii=False)
+
+
+def test_business_connection_cache_handles_datetime_date(tmp_path, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "7910015203:test-token")
+    aware = datetime(2026, 4, 26, 17, 42, 8, tzinfo=timezone.utc)
+    connection = Obj(
+        id="biz-connection-secret",
+        user=Obj(id=123456789, username="story_owner_fixture"),
+        user_chat_id=987654321,
+        date=aware,
+        is_enabled=True,
+        rights=Obj(can_manage_stories=True),
+        can_reply=True,
+    )
+
+    target = tmp_path / "connections.enc.json"
+    record = cache_business_connection(connection, path=target)
+
+    assert record["is_new"] is True
+    assert record["state_changed"] is True
+    restored = load_cached_business_connections(path=target)
+    assert restored[0]["date"] == int(aware.timestamp())
+
+
+def test_business_connection_cache_marks_existing_record_not_new(tmp_path, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "7910015203:test-token")
+    target = tmp_path / "connections.enc.json"
+    base_kwargs = dict(
+        id="biz-connection-secret",
+        user=Obj(id=123456789, username="story_owner_fixture"),
+        user_chat_id=987654321,
+        date=1777194243,
+        rights=Obj(can_manage_stories=True),
+        can_reply=True,
+    )
+
+    first = cache_business_connection(Obj(is_enabled=True, **base_kwargs), path=target)
+    assert first["is_new"] is True
+    assert first["state_changed"] is True
+
+    second = cache_business_connection(Obj(is_enabled=True, **base_kwargs), path=target)
+    assert second["is_new"] is False
+    assert second["state_changed"] is False
+
+    third = cache_business_connection(Obj(is_enabled=False, **base_kwargs), path=target)
+    assert third["is_new"] is False
+    assert third["state_changed"] is True
+
+
+def test_business_story_targets_can_select_by_username_runtime_value(tmp_path, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "7910015203:test-token")
+    monkeypatch.delenv("VIDEO_ANNOUNCE_STORY_BUSINESS_TARGETS", raising=False)
+    target = tmp_path / "connections.enc.json"
+    cache_business_connection(
+        Obj(
+            id="biz-connection-secret",
+            user=Obj(id=123456789, username="story_owner_fixture"),
+            user_chat_id=987654321,
+            date=1777194243,
+            is_enabled=True,
+            rights=Obj(can_manage_stories=True),
+        ),
+        path=target,
+    )
+
+    targets = load_business_story_targets(
+        path=target,
+        selector_raw='["@story_owner_fixture"]',
+    )
+
+    assert len(targets) == 1
+    serialized = json.dumps(targets, ensure_ascii=False)
+    assert "story_owner_fixture" not in serialized
+    assert "biz-connection-secret" in serialized

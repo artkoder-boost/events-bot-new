@@ -250,6 +250,7 @@ async def test_story_preflight_only_requires_primary_target(monkeypatch: pytest.
 
     report = await helper._story_targets_report(
         client,
+        auth={},
         config={
             "targets": [
                 {"peer": "@kenigevents", "mode": "upload"},
@@ -296,6 +297,7 @@ async def test_story_publish_continues_after_non_blocking_fanout_failure(
 
     report = await helper._story_targets_report(
         client,
+        auth={},
         config={
             "targets": [
                 {"peer": "@kenigevents", "mode": "upload"},
@@ -317,3 +319,183 @@ async def test_story_publish_continues_after_non_blocking_fanout_failure(
     assert len(client.sent_requests) == 2
     assert client.sent_requests[1]["fwd_from_story"] == 101
     assert client.sent_requests[1]["fwd_from_id"] == "peer:@kenigevents"
+
+
+@pytest.mark.asyncio
+async def test_story_publish_marks_required_fanout_failure_after_render(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_story_request_types(monkeypatch)
+
+    async def _fake_input_media_for_path(*_args, **_kwargs):  # noqa: ANN002,ANN003
+        return "uploaded-media"
+
+    monkeypatch.setattr(helper, "_input_media_for_path", _fake_input_media_for_path)
+    monkeypatch.setattr(helper, "_extract_story_id", lambda result: result.story_id)
+
+    media_path = tmp_path / "story.mp4"
+    media_path.write_bytes(b"video")
+
+    preflight = await helper._story_targets_report(
+        _FakeStoryClient(
+            boost_fail_peers={"peer:@kenigevents"},
+            story_ids={},
+        ),
+        auth={},
+        config={
+            "targets": [
+                {"peer": "me", "mode": "upload"},
+                {"peer": "@kenigevents", "mode": "repost_previous", "required": True},
+                {"peer": "@lovekenig", "mode": "repost_previous", "required": True},
+            ]
+        },
+        log=lambda *_args, **_kwargs: None,
+        phase="preflight",
+        media_path=None,
+        honor_delays=False,
+    )
+
+    assert preflight["ok"] is True
+    assert preflight["blocking_ok"] is True
+    assert preflight["required_ok"] is False
+
+    publish = await helper._story_targets_report(
+        _FakeStoryClient(
+            boost_fail_peers={"peer:@kenigevents"},
+            story_ids={
+                "peer:me": 100,
+                "peer:@lovekenig": 202,
+            },
+        ),
+        auth={},
+        config={
+            "targets": [
+                {"peer": "me", "mode": "upload"},
+                {"peer": "@kenigevents", "mode": "repost_previous", "required": True},
+                {"peer": "@lovekenig", "mode": "repost_previous", "required": True},
+            ]
+        },
+        log=lambda *_args, **_kwargs: None,
+        phase="publish",
+        media_path=media_path,
+        honor_delays=False,
+    )
+
+    assert publish["ok"] is False
+    assert publish["blocking_ok"] is True
+    assert publish["required_ok"] is False
+    assert publish["fanout_ok"] is False
+    assert [item["required"] for item in publish["targets"]] == [True, True, True]
+    assert [item["ok"] for item in publish["targets"]] == [True, False, True]
+    assert [item.get("story_id") for item in publish["targets"]] == [100, None, 202]
+
+
+@pytest.mark.asyncio
+async def test_story_publish_posts_business_target_via_bot_api(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_story_request_types(monkeypatch)
+    client = _FakeStoryClient(boost_fail_peers=set(), story_ids={})
+    media_path = tmp_path / "story.mp4"
+    media_path.write_bytes(b"video")
+    calls: list[dict[str, object]] = []
+
+    class _Response:
+        status_code = 200
+        text = ""
+
+        def json(self) -> dict[str, object]:
+            return {"ok": True, "result": {"id": 777}}
+
+    def fake_post(url, data=None, files=None, timeout=None):  # noqa: ANN001
+        calls.append(
+            {
+                "url": url,
+                "data": dict(data or {}),
+                "file_name": files["story"][0],
+                "timeout": timeout,
+            }
+        )
+        return _Response()
+
+    monkeypatch.setattr(helper.requests, "post", fake_post)
+
+    report = await helper._story_targets_report(
+        client,
+        auth={
+            "business_bot_token": "123:test",
+            "business_connections": [
+                {
+                    "connection_hash": "hash-1",
+                    "connection_id": "biz-secret",
+                    "is_enabled": True,
+                    "can_manage_stories": True,
+                }
+            ],
+        },
+        config={
+            "period_seconds": 43200,
+            "targets": [
+                {
+                    "peer": "business:hash-1",
+                    "label": "business:hash-1",
+                    "transport": "telegram_business",
+                    "business_connection_hash": "hash-1",
+                    "delay_seconds": 600,
+                },
+            ],
+        },
+        log=lambda *_args, **_kwargs: None,
+        phase="publish",
+        media_path=media_path,
+        honor_delays=False,
+    )
+
+    assert report["ok"] is True
+    assert report["targets"][0]["transport"] == "telegram_business"
+    assert report["targets"][0]["story_id"] == 777
+    assert calls
+    assert calls[0]["url"] == "https://api.telegram.org/bot123:test/postStory"
+    data = calls[0]["data"]
+    assert data["business_connection_id"] == "biz-secret"
+    assert data["active_period"] == "43200"
+    assert data["post_to_chat_page"] == "true"
+    assert "biz-secret" not in str(report)
+
+
+@pytest.mark.asyncio
+async def test_business_target_missing_secret_blocks_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_story_request_types(monkeypatch)
+    client = _FakeStoryClient(boost_fail_peers=set(), story_ids={})
+
+    report = await helper._story_targets_report(
+        client,
+        auth={"business_bot_token": "123:test", "business_connections": []},
+        config={
+            "period_seconds": 43200,
+            "targets": [
+                {
+                    "peer": "business:hash-1",
+                    "label": "business:hash-1",
+                    "transport": "telegram_business",
+                    "business_connection_hash": "hash-1",
+                    "blocking": True,
+                    "required": True,
+                },
+            ],
+        },
+        log=lambda *_args, **_kwargs: None,
+        phase="preflight",
+        media_path=None,
+        honor_delays=False,
+    )
+
+    assert report["ok"] is False
+    assert report["blocking_ok"] is False
+    assert report["required_ok"] is False
+    assert report["targets"][0]["ok"] is False
+    assert "business connection secret is missing" in report["targets"][0]["error"]

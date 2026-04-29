@@ -10,7 +10,7 @@ from functools import lru_cache
 from itertools import combinations
 from typing import Any, Mapping, Sequence
 
-from .llm_support import GuideSecretsProviderAdapter, guide_account_name, resolve_candidate_key_ids
+from .llm_support import GuideSecretsProviderAdapter, env_int_clamped, guide_account_name, resolve_candidate_key_ids
 from .parser import collapse_ws
 
 logger = logging.getLogger(__name__)
@@ -38,6 +38,18 @@ GUIDE_EXCURSIONS_GOOGLE_ACCOUNT_ENV = (
 GUIDE_EXCURSIONS_GOOGLE_ACCOUNT_FALLBACK_ENV = (
     os.getenv("GUIDE_EXCURSIONS_GOOGLE_ACCOUNT_FALLBACK_ENV") or "GOOGLE_API_LOCALNAME"
 ).strip() or "GOOGLE_API_LOCALNAME"
+GUIDE_EXCURSIONS_DEDUP_LLM_TIMEOUT_SECONDS = env_int_clamped(
+    "GUIDE_EXCURSIONS_DEDUP_LLM_TIMEOUT_SEC",
+    90,
+    minimum=30,
+    maximum=600,
+)
+GUIDE_EXCURSIONS_DEDUP_TOTAL_TIMEOUT_SECONDS = env_int_clamped(
+    "GUIDE_EXCURSIONS_DEDUP_TOTAL_TIMEOUT_SEC",
+    45,
+    minimum=10,
+    maximum=600,
+)
 
 _PAIR_DECISION_CACHE: dict[str, dict[str, Any]] = {}
 _STOPWORDS = {
@@ -514,16 +526,19 @@ async def _ask_pair_judge_llm(left: Mapping[str, Any], right: Mapping[str, Any],
         f"Input:\n{json.dumps(payload, ensure_ascii=False)}"
     )
     try:
-        raw, _usage = await client.generate_content_async(
-            model=GUIDE_EXCURSIONS_DEDUP_MODEL,
-            prompt=prompt,
-            generation_config={
-                "temperature": 0,
-                "response_mime_type": "application/json",
-                "response_schema": schema,
-            },
-            max_output_tokens=420,
-            candidate_key_ids=list(candidate_key_ids) if candidate_key_ids else None,
+        raw, _usage = await asyncio.wait_for(
+            client.generate_content_async(
+                model=GUIDE_EXCURSIONS_DEDUP_MODEL,
+                prompt=prompt,
+                generation_config={
+                    "temperature": 0,
+                    "response_mime_type": "application/json",
+                    "response_schema": schema,
+                },
+                max_output_tokens=420,
+                candidate_key_ids=list(candidate_key_ids) if candidate_key_ids else None,
+            ),
+            timeout=float(GUIDE_EXCURSIONS_DEDUP_LLM_TIMEOUT_SECONDS),
         )
     except Exception as exc:
         logger.warning("guide_dedup: llm pair judge failed left=%s right=%s err=%s", left.get("id"), right.get("id"), exc)
@@ -644,12 +659,36 @@ async def deduplicate_occurrence_rows(
     pair_decisions: list[dict[str, Any]] = []
     uf = _UnionFind(list(row_by_id.keys()))
     canonical_votes: dict[int, float] = {}
+    started_at = asyncio.get_running_loop().time()
     for pair in pairs:
+        elapsed = asyncio.get_running_loop().time() - started_at
+        remaining = float(GUIDE_EXCURSIONS_DEDUP_TOTAL_TIMEOUT_SECONDS) - elapsed
+        if remaining <= 0:
+            logger.warning(
+                "guide_dedup: total budget exhausted family=%s pairs_done=%s pairs_total=%s",
+                family,
+                len(pair_decisions),
+                len(pairs),
+            )
+            break
         left = row_by_id.get(pair.left_id)
         right = row_by_id.get(pair.right_id)
         if not left or not right:
             continue
-        decision = await _decide_pair(left, right, pair.features)
+        try:
+            decision = await asyncio.wait_for(
+                _decide_pair(left, right, pair.features),
+                timeout=max(1.0, min(float(GUIDE_EXCURSIONS_DEDUP_LLM_TIMEOUT_SECONDS), remaining)),
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "guide_dedup: pair budget exhausted family=%s left=%s right=%s pairs_done=%s",
+                family,
+                pair.left_id,
+                pair.right_id,
+                len(pair_decisions),
+            )
+            break
         entry = {
             "left_id": pair.left_id,
             "right_id": pair.right_id,

@@ -59,9 +59,12 @@ from .popular_review import (
     build_popular_review_selection,
 )
 from .story_publish import (
+    STORY_PUBLISH_CIPHER_FILENAME,
     STORY_PUBLISH_CONFIG_FILENAME,
+    STORY_PUBLISH_KEY_FILENAME,
     build_story_publish_config,
     ensure_story_secret_datasets,
+    write_story_secret_files,
 )
 from .poller import (
     VIDEO_MAX_MB,
@@ -1424,16 +1427,16 @@ class VideoAnnounceScenario:
             valid=True,
         )
 
-    async def run_popular_review_pipeline(self) -> None:
+    async def run_popular_review_pipeline(self, *, wait_for_handoff: bool = False) -> int | None:
         if not await self.ensure_access():
-            return
+            return None
         existing = await self.has_rendering()
         if existing:
             await self.bot.send_message(
                 self.chat_id,
                 f"Сессия #{existing.id} уже рендерится, дождитесь завершения",
             )
-            return
+            return None
 
         try:
             selection = await build_popular_review_selection(
@@ -1450,12 +1453,12 @@ class VideoAnnounceScenario:
                     f"для публикации ({type(exc).__name__}: {exc})"
                 ),
             )
-            return
+            return None
 
         kernel_ref = self._pick_cherryflash_kernel_ref() or self._pick_default_kernel_ref()
         if not kernel_ref:
             await self.bot.send_message(self.chat_id, "Не удалось подобрать CherryFlash kernel для Kaggle")
-            return
+            return None
 
         configured_test_chat_id, _configured_main_chat_id = await self._get_profile_channels(
             POPULAR_REVIEW_PROFILE
@@ -1507,9 +1510,12 @@ class VideoAnnounceScenario:
             obj.id,
             message=None,
             limit_scenes=len(selection.event_ids),
+            background=not wait_for_handoff,
         )
         if msg and msg != "Рендеринг запущен":
             await self.bot.send_message(self.chat_id, f"Сессия #{obj.id}: {msg}")
+            return None
+        return int(obj.id)
 
     def _dataset_audio_name_for_kernel(
         self,
@@ -2467,24 +2473,14 @@ class VideoAnnounceScenario:
                 kernel_ref = actual_ref
             session_obj.kaggle_dataset = dataset_slug
             session_obj.kaggle_kernel_ref = kernel_ref
+            await await_kernel_dataset_sources(
+                client,
+                kernel_ref,
+                dataset_sources,
+                timeout_seconds=VIDEO_KAGGLE_DATASET_BIND_WAIT_SECONDS,
+                poll_interval_seconds=VIDEO_KAGGLE_DATASET_BIND_POLL_SECONDS,
+            )
             await self._store_kaggle_meta(session_obj.id, dataset_slug, kernel_ref)
-            try:
-                await await_kernel_dataset_sources(
-                    client,
-                    kernel_ref,
-                    dataset_sources,
-                    timeout_seconds=VIDEO_KAGGLE_DATASET_BIND_WAIT_SECONDS,
-                    poll_interval_seconds=VIDEO_KAGGLE_DATASET_BIND_POLL_SECONDS,
-                )
-            except Exception:
-                if str(getattr(session_obj, "profile_key", "") or "").strip() == POPULAR_REVIEW_PROFILE:
-                    logger.warning(
-                        "video_announce: CherryFlash kernel metadata did not expose expected dataset_sources in time; "
-                        "continuing with normal Kaggle polling because kernels_push already succeeded",
-                        exc_info=True,
-                    )
-                else:
-                    raise
 
             try:
                 kaggle_status = await asyncio.to_thread(
@@ -3110,6 +3106,7 @@ class VideoAnnounceScenario:
         message: types.Message | None = None,
         *,
         limit_scenes: int | None = None,
+        background: bool = True,
     ) -> str:
         if not await self._has_access():
             return "Not authorized"
@@ -3173,6 +3170,13 @@ class VideoAnnounceScenario:
             
             payload = await self._build_render_payload(sess, ranked)
             payload_json = payload_as_json(payload, timezone.utc)
+            params = (
+                dict(sess.selection_params)
+                if isinstance(sess.selection_params, dict)
+                else {}
+            )
+            params["notify_chat_id"] = self.chat_id
+            sess.selection_params = params
             sess.status = VideoAnnounceSessionStatus.RENDERING
             sess.started_at = datetime.now(timezone.utc)
             session.add(sess)
@@ -3205,15 +3209,17 @@ class VideoAnnounceScenario:
             allow_send=True,
             note="Готовим Kaggle",
         )
-        asyncio.create_task(
-            self._render_and_notify(
-                sess,
-                ranked,
-                status_message=status_message,
-                payload=payload,
-                payload_json=payload_json,
-            )
+        render_coro = self._render_and_notify(
+            sess,
+            ranked,
+            status_message=status_message,
+            payload=payload,
+            payload_json=payload_json,
         )
+        if background:
+            asyncio.create_task(render_coro)
+        else:
+            await render_coro
         return "Рендеринг запущен"
 
     async def restart_session(self, session_id: int) -> None:
@@ -3623,7 +3629,7 @@ class VideoAnnounceScenario:
                         json.dumps(story_config, ensure_ascii=False, indent=2),
                         encoding="utf-8",
                     )
-                    story_dataset_sources = await ensure_story_secret_datasets(client)
+                    write_story_secret_files(tmp_path)
                 else:
                     raise RuntimeError(
                         "CherryFlash story publish was requested but story_publish.json was not generated"
@@ -3640,6 +3646,14 @@ class VideoAnnounceScenario:
                 encoding="utf-8",
             )
             bundle_manifest_files = ["payload.json", "assets/cherryflash_selection.json"]
+            if story_publish_requested:
+                bundle_manifest_files.extend(
+                    [
+                        STORY_PUBLISH_CONFIG_FILENAME,
+                        STORY_PUBLISH_CIPHER_FILENAME,
+                        STORY_PUBLISH_KEY_FILENAME,
+                    ]
+                )
             for src, rel in self._iter_cherryflash_bundle_files():
                 if not src.exists():
                     raise RuntimeError(f"Missing CherryFlash runtime asset: {src}")

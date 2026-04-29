@@ -63,6 +63,7 @@ For admin-facing scheduled reports, the bot now resolves the target chat from th
 - **Telegram daily announcements** – posts `/daily` channel announcements after configured `daily_time`; scheduler has per-channel in-process dedup guard (inflight + sent-today cache) to prevent repeated sends while one run is still in progress.
   - Daily build must treat shortlink enrichment as best-effort: if VK `utils.getShortLink` fails for one actor/token path (including `code=8 / Application is blocked`), the run must fall back to the next token or keep the original URL instead of stalling the whole announcement.
 - **VK daily posts and polls** – publishes daily announcements and festival polls when posting times are reached and a VK group is configured.
+  - VK daily announcements are split into multiple `wall.post` calls when the generated section exceeds `VK_DAILY_POST_MAX_CHARS` (default `12000`) so a busy day does not fail with VK `message_character_limit`. The split preserves event cards when possible and the slot is marked sent only after every chunk returns a VK post URL.
 - **VK auto queue import** – imports queued VK posts (`vk_inbox`) via Smart Update on a fixed schedule when enabled.
 - **Telegraph pages sync** – refreshes month and weekend Telegraph pages after 01:00 local time. Disabled by default; enable with `ENABLE_NIGHTLY_PAGE_SYNC=1`. Nightly runs update both page content and the month navigation block.
 - **Telegraph cache sanitizer** – probes and warms Telegram web preview for Telegraph pages (via Kaggle/Telethon), tracks missing `cached_page` (Instant View) and warns on missing preview `photo`, and enqueues rebuilds for persistent “no cached_page” failures. Skips past pages (ended events / past weekends / past months). Manual `/telegraph_cache_sanitize` updates a single Kaggle status message while polling (like `/tg`), scheduled runs post a final summary to `ADMIN_CHAT_ID` when configured. Disabled by default; enable with `ENABLE_TELEGRAPH_CACHE_SANITIZER=1`.
@@ -77,7 +78,7 @@ For admin-facing scheduled reports, the bot now resolves the target chat from th
   - canonical mode is production: it uses `VideoAnnounceScenario.run_tomorrow_pipeline(... test_mode=False)`;
   - `V_TOMORROW_TEST_MODE=1` can temporarily switch the same slot back to the legacy test-render path;
   - when `VIDEO_ANNOUNCE_STORY_ENABLED=1`, the same Kaggle notebook can also publish the finished `/v` video to Telegram stories from inside Kaggle and attach `story_publish_report.json` to the kernel output;
-  - for story fanout use explicit `VIDEO_ANNOUNCE_STORY_TARGETS_JSON` when order matters; `main` channel + `VIDEO_ANNOUNCE_STORY_EXTRA_TARGETS_JSON` remain only as fallback;
+  - for story fanout use explicit `VIDEO_ANNOUNCE_STORY_TARGETS_JSON` when order matters; production keeps `me` as the blocking upload target and marks channel reposts as `required=true`, so Telegram boost failures do not waste the render but still fail the final publish status; `main` channel + `VIDEO_ANNOUNCE_STORY_EXTRA_TARGETS_JSON` remain only as fallback;
   - recommended default window: `16:00 Europe/Kaliningrad`, so even the worst-case `225` minute runtime plus a `10` minute second-target story delay still finishes before the `21:00` audience window.
 - **Telegram monitoring** – scheduled daily import from Telegram sources (channels/groups) via Kaggle when enabled.
 - перед `push` мониторинг проверяет shared remote Telegram session guard по `kaggle_registry`; если другой Telegram-based Kaggle job ещё жив или его status lookup не дал надёжного ответа, текущий run фиксируется как `skipped` вместо запуска второй удалённой Telethon session.
@@ -98,15 +99,20 @@ For admin-facing scheduled reports, the bot now resolves the target chat from th
   - when production also sets `VIDEO_ANNOUNCE_STORY_REQUIRED=1`, `/healthz` must fail closed if story publish is unexpectedly disabled or the required auth/target env path is broken, so stale deploy branches cannot silently downgrade `/v` to mp4-only delivery;
   - story-enabled exact reruns and regular cron runs must share the same dataset/story path: if `VIDEO_ANNOUNCE_STORY_ENABLED=1`, both paths should generate `story_publish.json` and the encrypted auth datasets;
   - `CrumpleVideo` keeps its main render at `1080x1572`, but story upload must use a story-safe `1080x1920` derivative with padding instead of sending the raw non-`9:16` mp4;
-  - for story fanout use explicit `VIDEO_ANNOUNCE_STORY_TARGETS_JSON` when order matters; `main` channel + `VIDEO_ANNOUNCE_STORY_EXTRA_TARGETS_JSON` remain only as fallback;
+  - for story fanout use explicit `VIDEO_ANNOUNCE_STORY_TARGETS_JSON` when order matters; production keeps `me` as the blocking upload target and marks channel reposts as `required=true`, so Telegram boost failures do not waste the render but still fail the final publish status; `main` channel + `VIDEO_ANNOUNCE_STORY_EXTRA_TARGETS_JSON` remain only as fallback;
   - recommended default window: `16:45 Europe/Kaliningrad`, which centers the historical GPU render window (`~1:45..2:40`) near `19:00` while still keeping buffer before the `20:10` guide full scan.
+- **CherryFlash `popular_review`** – optional scheduled daily popularity story when `ENABLE_V_POPULAR_REVIEW_SCHEDULED=1`.
+  - the scheduled path uses `VideoAnnounceScenario.run_popular_review_pipeline(wait_for_handoff=True)` and must not mark `ops_run(kind='video_popular_review')` as `success` until `videoannounce_session.kaggle_dataset` is set and `kaggle_kernel_ref` is a real Kaggle slug, not `local:CherryFlash`;
+  - startup catch-up and the live watchdog retry the same local-day slot when the only matching CherryFlash session failed before Kaggle handoff;
+  - duplicate prevention is based on remote handoff evidence: a matching session with a non-local kernel ref plus `cherryflash-session-*` dataset suppresses catch-up even if local status later drifts.
 - **kaggle recovery** – resumes in-flight Kaggle jobs after restarts, including `tg_monitoring` and `guide_monitoring`.
   - `guide_monitoring` now keeps a persisted copy of the downloaded results bundle under `GUIDE_MONITORING_RESULTS_STORE_ROOT` (default `/data/guide_monitoring_results`), so a restart during server import or scheduled digest publish can resume from the saved `results_path` instead of depending on a second Kaggle download.
   - for scheduled `full` guide runs with `ENABLE_GUIDE_DIGEST_SCHEDULED=1`, recovery is responsible for finishing both the import and the same-job digest auto-publish if the process died in between.
 
 ## Health Checks
 
-- Fly probes `GET /healthz` every 15 seconds.
+- Fly service-level health checks must be visible in `flyctl config show` as `services.http_checks` for `GET /healthz`; legacy-looking `services.checks` entries in local `fly.toml` are not enough if the deployed config omits them.
+- Fly probes `GET /healthz` every 15 seconds after startup grace.
 - `/healthz` no longer returns a blind static `ok`: it verifies that startup completed, the runtime heartbeat is fresh, required background tasks (`daily_scheduler`, `add_event_watch`, and `job_outbox_worker` when enabled) are alive, the bot session is open, and SQLite answers `SELECT 1`.
 - The same applies to scheduler watchdog hooks: if `video_tomorrow` or critical scheduler watchdog support is enabled in runtime, `create_app()` must import the matching `scheduler_*_watchdog_*` callables from `scheduling.py`; a missing import is a production defect because it turns `/healthz` into `500` and silently disables watchdog ticks instead of degrading to a normal `503` health report.
 - `add_event_watch` is allowed to restart a stalled add-event worker in place; the watchdog now updates the shared dequeue timestamp correctly instead of tripping an `UnboundLocalError` during stall recovery and poisoning `/healthz`.
@@ -149,12 +155,15 @@ For admin-facing scheduled reports, the bot now resolves the target chat from th
 - `V_TOMORROW_MISFIRE_GRACE_SECONDS` – per-job APScheduler misfire window for `video_tomorrow` (default: `600`), so short loop stalls near the slot do not silently drop the run.
 - `V_TOMORROW_WATCHDOG_GRACE_SECONDS` – same-day local-time grace window after the slot before the independent watchdog dispatches a missing `video_tomorrow` run (default: `720`).
 - `V_TOMORROW_WATCHDOG_INTERVAL_SECONDS` – polling interval for the independent `video_tomorrow` watchdog task (default: `60`).
+- `ENABLE_V_POPULAR_REVIEW_SCHEDULED` – enable scheduled CherryFlash `popular_review`.
+- `V_POPULAR_REVIEW_TIME_LOCAL` / `V_POPULAR_REVIEW_TZ` – local schedule for CherryFlash `popular_review` (default: `10:15 Europe/Kaliningrad`).
+- `V_POPULAR_REVIEW_WATCHDOG_GRACE_SECONDS` – same-day local-time grace window after the CherryFlash slot before the independent watchdog dispatches a missing local-only pre-handoff run (default: `900`).
 - `VIDEO_KAGGLE_TIMEOUT_MINUTES` – `/v` Kaggle timeout in minutes (default `225`).
 - `VIDEO_ANNOUNCE_STORY_ENABLED` – enable Kaggle-side story publish for `/v`.
 - `VIDEO_ANNOUNCE_STORY_REQUIRED` – optional prod guard: when enabled, `/healthz` fails if `/v` story publish is disabled or obviously misconfigured.
 - `VIDEO_ANNOUNCE_STORY_AUTH_BUNDLE_ENV` / `VIDEO_ANNOUNCE_STORY_SESSION_ENV` – explicit auth source passed into Kaggle for story publish; the same encrypted auth runtime is also reused by notebook-side Telegram poster-cache rescue when direct poster URLs are dead.
+- `VIDEO_ANNOUNCE_STORY_TARGETS_JSON` – explicit ordered story targets list; when set, it overrides `main`-channel-derived ordering and `VIDEO_ANNOUNCE_STORY_EXTRA_TARGETS_JSON`. Production should keep the first blocking target as `me` and put required channel reposts after it with `required=true`, so downstream `BOOSTS_REQUIRED` channel failures stay visible, do not prevent render delivery, and still fail the final publish status.
 - `SOURCE_CHANNEL_ID` – optional Telegram channel id embedded into the encrypted story auth payload so Kaggle can search that channel by filename for poster rescue instead of defaulting to Saved Messages.
-- `VIDEO_ANNOUNCE_STORY_TARGETS_JSON` – explicit ordered story targets list; when set, it overrides `main`-channel-derived ordering and `VIDEO_ANNOUNCE_STORY_EXTRA_TARGETS_JSON`.
 - `VIDEO_ANNOUNCE_STORY_USE_MAIN_CHANNEL` – use the profile `main` channel as the first story target (default `1`).
 - `VIDEO_ANNOUNCE_STORY_EXTRA_TARGETS_JSON` – optional extra story targets with per-target `delay_seconds`.
 - `VIDEO_ANNOUNCE_STORY_PERIOD_SECONDS` – story TTL passed to Telegram (default `86400`).
@@ -172,7 +181,7 @@ For admin-facing scheduled reports, the bot now resolves the target chat from th
 - `VIDEO_KAGGLE_TIMEOUT_MINUTES` – `/v` Kaggle timeout in minutes (default `225`).
 - `VIDEO_ANNOUNCE_STORY_ENABLED` – enable Kaggle-side story publish for `/v`.
 - `VIDEO_ANNOUNCE_STORY_AUTH_BUNDLE_ENV` / `VIDEO_ANNOUNCE_STORY_SESSION_ENV` – explicit auth source passed into Kaggle for story publish.
-- `VIDEO_ANNOUNCE_STORY_TARGETS_JSON` – explicit ordered story targets list; when set, it overrides `main`-channel-derived ordering and `VIDEO_ANNOUNCE_STORY_EXTRA_TARGETS_JSON`.
+- `VIDEO_ANNOUNCE_STORY_TARGETS_JSON` – explicit ordered story targets list; when set, it overrides `main`-channel-derived ordering and `VIDEO_ANNOUNCE_STORY_EXTRA_TARGETS_JSON`. Production should keep the first blocking target as `me` and put required channel reposts after it with `required=true`, so downstream `BOOSTS_REQUIRED` channel failures stay visible, do not prevent render delivery, and still fail the final publish status.
 - `VIDEO_ANNOUNCE_STORY_USE_MAIN_CHANNEL` – use the profile `main` channel as the first story target (default `1`).
 - `VIDEO_ANNOUNCE_STORY_EXTRA_TARGETS_JSON` – optional extra story targets with per-target `delay_seconds`.
 - `VIDEO_ANNOUNCE_STORY_PERIOD_SECONDS` – story TTL passed to Telegram (default `86400`).
@@ -189,6 +198,6 @@ For admin-facing scheduled reports, the bot now resolves the target chat from th
 - `TG_MONITORING_RECOVERY_TERMINAL_GRACE_MINUTES` – how long `tg_monitoring` recovery should keep rechecking Kaggle jobs that temporarily report `failed/error/cancelled` before dropping them as irrecoverable (default: `360`).
 - `RUNTIME_HEALTH_HEARTBEAT_SEC` – how often the in-process runtime heartbeat updates (default: `15` seconds).
 - `RUNTIME_HEALTH_STALE_SEC` – max allowed heartbeat age before `/healthz` turns unhealthy (default: `45` seconds, minimum `2x` heartbeat interval).
-- `RUNTIME_HEALTH_STARTUP_GRACE_SEC` – startup grace window before “not ready yet” becomes a failing `/healthz` condition (default: `120` seconds).
+- `RUNTIME_HEALTH_STARTUP_GRACE_SEC` – startup grace window before “not ready yet” becomes a failing `/healthz` condition (default: `120` seconds). Fly service-level check grace is `60s` in production because Fly caps longer service check grace periods to one minute; if cold boot grows beyond that, treat it as a startup-performance/serving-readiness incident instead of hiding it behind a longer Fly grace.
 
 To monitor real job durations, use the daily `/general_stats` report: it prints per-run `took=...` for `vk_auto_import` and `tg_monitoring` (and other ops-run instrumented jobs).

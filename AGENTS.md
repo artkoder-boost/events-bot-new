@@ -12,6 +12,7 @@
 ## Incident Mode (critical)
 
 - Упоминание конкретного incident ID (`INC-*`) само по себе достаточно, чтобы агент перешёл в incident workflow.
+- Production недоступность или user-visible деградация тоже автоматически включает incident workflow даже без готового `INC-*`: `/healthz` timeout/not ready, Fly proxy `/webhook` errors, бот не отвечает на `/start` или другие базовые команды, critical scheduled slot сорван/завис.
 - В incident workflow агент обязан:
   - открыть канонический incident record;
   - трактовать его как regression contract;
@@ -85,6 +86,14 @@
 - Отчёты/черновики Codex CLI по умолчанию складывай в `artifacts/codex/` (см. `docs/tools/codex-cli.md`).
 - Не коммить артефакты. Если нужно сохранить пример — клади **минимальный** fixture в `tests/fixtures/` (если такой паттерн уже есть).
 
+## Runtime Logs (critical)
+
+- Для production/scheduled/Kaggle расследований сразу открывай `docs/operations/runtime-logs.md`.
+- Перед заявлением, что логи отсутствуют или потеряны, агент обязан проверить production file mirror на volume: фактические env `ENABLE_RUNTIME_FILE_LOGGING` / `RUNTIME_LOG_DIR`, директорию `/data/runtime_logs`, активный файл и rotated файлы.
+- Ищи не одним grep: используй `run_id`, `ops_run` id, job kind, Kaggle kernel ref, source username, временное окно и класс ошибки.
+- Если file mirror выключен или retention уже удалил нужный период, явно напиши это как найденный факт и переходи к fallback evidence: `fly logs`, Kaggle output/logs, `ops_run.details_json`, production DB rows и `artifacts/codex/`.
+- Для длинных расследований сохраняй минимальные релевантные выдержки логов и JSON в `artifacts/codex/<task-or-run-id>/`; не коммить артефакты.
+
 ## Git / Push Policy
 
 - Канонический workflow для branch/worktree и безопасной изоляции параллельной разработки: `docs/operations/repository-workflow.md`.
@@ -103,6 +112,11 @@
 - `origin/main` — единственный steady-state source of truth для production. Каноника: `docs/operations/release-governance.md`.
 - `release/*` и `hotfix/*` допустимы только как короткоживущие ветки; prod-fix не считается доставленным, пока commit не достижим из `origin/main`.
 - Не оставляй production-значимые фиксы только в side-ветках и не закрывай инцидент до back-merge в `main`.
+- Для prod-bound задач агент обязан сам привести deploy/tooling в рабочее состояние:
+  - сначала проверить стандартные локальные пути и user-level install locations для нужных CLI (`flyctl`, `gh`, и т.п.), а не только текущий `PATH`;
+  - если CLI найден вне `PATH`, использовать абсолютный путь или экспортировать корректный `PATH` в текущем процессе;
+  - если CLI действительно отсутствует, агент должен установить его или предложить минимальный reproducible bootstrap, а не объявлять отсутствие инструмента достаточным оправданием остановки;
+  - фразы вида "локально нет `flyctl`" не считаются допустимым closure/release explanation, если агент ещё не попытался self-bootstrap tooling.
 - Перед deploy обязательно:
   - `git fetch origin --prune`
   - проверить branch, чистоту worktree и связь с `origin/main`
